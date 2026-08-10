@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         厂长资源 观影历史记录增强版
 // @namespace    https://www.4kcz.com/
-// @version      1.2.0
+// @version      1.2.1
 // @description  为 厂长资源 影视站增加观影历史、播放进度记录、最新集数检测、并支持从历史新窗口打开后自动跳转到上次播放时间
 // @author       wg5945
 // @license      MIT
@@ -98,7 +98,7 @@
     }
 
     // 脚本加载确认（始终输出，仅一行）
-    console.log(`[观影历史] v1.2.0 已注入 ${isPlayerFrame() ? '播放器帧' : '主站'} | ${location.hostname}`);
+    console.log(`[观影历史] v1.2.1 已注入 ${isPlayerFrame() ? '播放器帧' : '主站'} | ${location.hostname}`);
 
     function normalizeUrl(url) {
         try { const u = new URL(url, location.href); u.hash = ''; return u.href; }
@@ -950,6 +950,12 @@
                 vertical-align: 1px;
             }
             .czzyv-history-item:hover .czzyv-history-episode { color: #c9ccd3; }
+            .czzyv-history-episode-unfinished {
+                background: #ff9800;
+                color: #fff; font-weight: 500;
+                box-shadow: 0 0 6px rgba(255, 152, 0, 0.5);
+            }
+            .czzyv-history-item:hover .czzyv-history-episode-unfinished { color: #fff; }
             .czzyv-history-tags {
                 display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
                 margin: 2px 0 0 0; min-height: 0;
@@ -1055,6 +1061,20 @@
                 newBadgeHtml = `<span class="czzyv-history-newbadge">有更新</span>`;
             }
 
+            // ★ 未完提醒（仅显示层，不改变任何存储逻辑）：
+            //   历史记录里 watchedEpisodeNumber 因合并语义可能已被拉到 latestEpisodeNumber，
+            //   这里改用当前 episodeText 重新解析"正在看的集数"做判断，更贴合实际观看进度。
+            //   1) 在看集数 < 更新至集数 → 还没追上
+            //   2) 在看集数 = 更新至集数 且 本集观看进度 < 80% → 还没看完最后一集
+            //   满足任一条件时，给"已看到的集数"徽章加特殊黄色样式。
+            const latestNum = Number(item.latestEpisodeNumber) || 0;
+            const realWatched = extractEpisodeNumber(item.episodeText) || 0;
+            const durationNum = Number(item.duration) || 0;
+            const unfinished = shouldShowLatest && latestNum > 0 && realWatched > 0 && (
+                realWatched < latestNum ||
+                (realWatched >= latestNum && durationNum > 0 && progressPercent < 80)
+            );
+
             const posterUrl = item.poster || '';
             const posterHtml = posterUrl
                 ? `<div class="czzyv-history-poster"><img src="${escapeHtml(posterUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.innerHTML='<div class=czzyv-history-poster-placeholder>无图</div>'">${latestBadgeHtml}</div>`
@@ -1077,8 +1097,11 @@
                     }
                 }
             }
+            const episodeBadgeClass = unfinished
+                ? 'czzyv-history-episode czzyv-history-episode-unfinished'
+                : 'czzyv-history-episode';
             const titleHtml = mainTitle && episodeText
-                ? `${escapeHtml(mainTitle)}<span class="czzyv-history-episode">${escapeHtml(episodeText)}</span>`
+                ? `${escapeHtml(mainTitle)}<span class="${episodeBadgeClass}"${unfinished ? ' title="尚未看完"' : ''}>${escapeHtml(episodeText)}</span>`
                 : escapeHtml(item.title || mainTitle);
 
             return `
