@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         厂长资源 观影历史记录增强版
 // @namespace    https://www.4kcz.com/
-// @version      1.2.1
+// @version      1.2.2
 // @description  为 厂长资源 影视站增加观影历史、播放进度记录、最新集数检测、并支持从历史新窗口打开后自动跳转到上次播放时间
 // @author       wg5945
 // @license      MIT
@@ -66,6 +66,12 @@
 
     // 正在fetch封面图的historyKey集合，防止重复请求
     const posterFetchingSet = new Set();
+    // 已确认失效的封面图 URL 集合，避免对同一失效地址反复探测/重抓
+    const posterBrokenSet = new Set();
+    // 同一 item 上次触发自动重抓封面图的时间（historyKey -> ms），用于节流
+    const posterRefetchLastAt = {};
+    // 失效封面图自动重抓的最小间隔：避免短时间内反复探测同一 URL
+    const POSTER_REFETCH_MIN_INTERVAL_MS = 30 * 60 * 1000;
 
     function hostMatches(hostList) {
         const host = location.hostname;
@@ -566,6 +572,56 @@
         return '';
     }
 
+    // 统一把封面 URL 规范化为绝对地址，便于对比失效旧地址与当前存储地址
+    // （extractPosterFromDocument 可能返回相对路径，而 img.onerror 里的 el.src 是绝对地址）
+    function normalizePosterUrl(u) {
+        try { return new URL(String(u || ''), location.href).href; } catch (e) { return String(u || ''); }
+    }
+
+    // 判断一条历史记录是否需要（重新）抓取封面图：无封面、或已确认失效且已过冷却期
+    function shouldRefetchPoster(item) {
+        if (!item || !item.url) return false;
+        const key = getHistorySeriesKey(item) || normalizeUrl(item.url);
+        if (!item.poster) return true;                       // 无封面 → 需要抓
+        if (posterFetchingSet.has(key)) return false;        // 正在抓 → 跳过
+        if (!posterBrokenSet.has(item.poster)) return false; // 封面有效 → 不重抓
+        // 封面已知失效：未到冷却期则跳过，否则允许重试
+        const lastAt = posterRefetchLastAt[key] || 0;
+        return Date.now() - lastAt >= POSTER_REFETCH_MIN_INTERVAL_MS;
+    }
+
+    // 从详情页重新抓取并更新单条历史记录的封面图；brokenPoster 传入失效旧地址以备对比去重
+    async function refetchPosterForItem(item, brokenPoster) {
+        if (!item || !item.url) return;
+        const key = getHistorySeriesKey(item) || normalizeUrl(item.url);
+        if (posterFetchingSet.has(key)) return;
+        posterFetchingSet.add(key);
+        try {
+            const detailUrl = item.detailUrl || buildDetailUrl(item.url);
+            if (!detailUrl) return;
+            const html = await fetchTextWithTimeout(detailUrl);
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            const poster = extractPosterFromDocument(doc);
+            if (!poster) return;
+            const list = getHistory();
+            const index = list.findIndex(x => (getHistorySeriesKey(x) || normalizeUrl(x.url)) === key);
+            if (index < 0) return;
+            // 仅当仍未有可用封面、或当前封面正是已知失效地址时，才覆盖
+            if (!list[index].poster || list[index].poster === brokenPoster
+                || normalizePosterUrl(list[index].poster) === normalizePosterUrl(brokenPoster)) {
+                list[index].poster = poster;
+                // 若详情页同时补了 detailUrl，一并写入
+                if (detailUrl && !list[index].detailUrl) list[index].detailUrl = detailUrl;
+                saveHistory(list);
+                renderHistoryList();
+            }
+        } catch (e) {
+            warn('封面图自动重抓失败', { url: item && item.url, error: e && e.message });
+        } finally {
+            posterFetchingSet.delete(key);
+        }
+    }
+
     async function fetchAndUpdatePoster(historyKey, detailUrl) {
         if (!historyKey || !detailUrl) return;
         if (posterFetchingSet.has(historyKey)) return;
@@ -604,6 +660,10 @@
             if (getHistorySeriesKey(list[i]) === key) {
                 list[i].poster = poster;
                 list[i].detailUrl = location.href;
+                // 详情页现取的封面是当前最新地址，清掉历史失效标记
+                posterBrokenSet.delete(poster);
+                posterBrokenSet.delete(normalizePosterUrl(poster));
+                delete posterRefetchLastAt[key];
                 changed = true;
             }
         }
@@ -622,7 +682,8 @@
                 const key = getHistorySeriesKey(oldItem) || normalizeUrl(oldItem.url);
                 const isSeries = isSeriesLikeHistoryItem(oldItem);
                 const needEpisodeCheck = isSeries && (force || !oldItem.latestEpisodeText || !Number(oldItem.latestEpisodeNumber));
-                const needPoster = !oldItem.poster;
+                // 封面图：无封面，或当前封面已被标记失效且过了重抓冷却期
+                const needPoster = shouldRefetchPoster(oldItem);
                 if (!needEpisodeCheck && !needPoster) continue;
 
                 const detailUrl = oldItem.detailUrl || buildDetailUrl(oldItem.url);
@@ -668,6 +729,10 @@
                     }
                     if (needPoster && poster) {
                         currentList[index].poster = poster;
+                        // 成功更新后清掉失效标记
+                        posterBrokenSet.delete(poster);
+                        posterBrokenSet.delete(normalizePosterUrl(poster));
+                        if (key) delete posterRefetchLastAt[key];
                     }
                     if (detailUrl && !currentList[index].detailUrl) {
                         currentList[index].detailUrl = detailUrl;
@@ -1076,8 +1141,13 @@
             );
 
             const posterUrl = item.poster || '';
+            // ★ 失效封面图自动重抓：img 加载失败时不再仅回退"无图"占位，
+            // 而是触发后台从详情页重新获取最新封面，成功后刷新历史列表。
+            // 注意：只替换 <img> 自身为占位 div，保留同级的"更新至XX集"角标，
+            // 避免封面失败时把角标一起冲掉。
+            const dataKey = escapeHtml(getHistorySeriesKey(item) || normalizeUrl(item.url));
             const posterHtml = posterUrl
-                ? `<div class="czzyv-history-poster"><img src="${escapeHtml(posterUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.innerHTML='<div class=czzyv-history-poster-placeholder>无图</div>'">${latestBadgeHtml}</div>`
+                ? `<div class="czzyv-history-poster"><img src="${escapeHtml(posterUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer" data-key="${dataKey}" onerror="(function(el){el.removeAttribute('onerror');var key=el.getAttribute('data-key');var bad=el.src;var ph=document.createElement('div');ph.className='czzyv-history-poster-placeholder';ph.textContent='无图';el.replaceWith(ph);if(key&&window.__czzyvHandlePosterError){window.__czzyvHandlePosterError(key,bad);}})(this)">${latestBadgeHtml}</div>`
                 : `<div class="czzyv-history-poster"><div class="czzyv-history-poster-placeholder">海报</div>${latestBadgeHtml}</div>`;
             const tagsHtml = newBadgeHtml
                 ? `<div class="czzyv-history-tags">${newBadgeHtml}</div>`
@@ -1156,6 +1226,34 @@
         });
     }
 
+    // 全局处理封面图加载失败：标记失效并触发后台从详情页重新抓取最新封面
+    // 在 iframe 中无意义（历史列表 UI 只在主站渲染），直接忽略。
+    function bindPosterErrorHandler() {
+        if (isInIframe()) return;
+        if (window.__czzyvHandlePosterErrorBound) return;
+        window.__czzyvHandlePosterErrorBound = true;
+        window.__czzyvHandlePosterError = function (key, brokenPoster) {
+            try {
+                if (!key) return;
+                const broken = normalizePosterUrl(brokenPoster || '');
+                if (broken) posterBrokenSet.add(broken);
+                // 节流：同一 key 在冷却期内只触发一次重抓。
+                // 历史列表每次重渲染都会生成新的 <img>，失效图会反复触发 onerror，
+                // 这里用冷却期挡住，避免对同一失效地址反复 fetch 详情页。
+                const lastAt = posterRefetchLastAt[key] || 0;
+                if (Date.now() - lastAt < POSTER_REFETCH_MIN_INTERVAL_MS) return;
+                posterRefetchLastAt[key] = Date.now();
+                log('封面图加载失败，已触发后台重抓', { key, broken });
+                const list = getHistory();
+                const item = list.find(x => (getHistorySeriesKey(x) || normalizeUrl(x.url)) === key);
+                if (!item) return;
+                // 若当前已不是失效那张，说明期间已更新过，无需再抓
+                if (broken && item.poster && normalizePosterUrl(item.poster) !== broken) return;
+                refetchPosterForItem(item, broken);
+            } catch (e) { warn('封面图失败处理异常', e); }
+        };
+    }
+
     function bindVideoEvents() {
         const video = document.querySelector('video');
         if (!video || video.__czzyvHistoryBound) return;
@@ -1190,6 +1288,7 @@
         bindIframeProgressMessage();
         addStyle();
         createUI();
+        bindPosterErrorHandler();
 
         if (isMovieDetailPage()) {
             setTimeout(() => updatePosterFromDetailPage(), 500);

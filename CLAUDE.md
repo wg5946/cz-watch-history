@@ -106,3 +106,8 @@ localStorage.setItem('CZ_HISTORY_DEBUG', '1')
 - Poster fetch uses `Set` to prevent duplicate concurrent requests per `historyKey`
 - Resume dispatcher runs max 15 times then gives up to avoid infinite loops
 - Video seek protection: won't overwrite progress during first 15s after resume starts
+
+## Versioning
+
+- **一次会话只升级一次 `@version`，除非用户特别要求。** 同一轮对话里做的所有改动（无论几个功能/修复）只 bump 一个小版本号一次；不要每改一处就升一版（例如一次会话内从 1.2.1 升到 1.2.2 即可，不要升到 1.2.3）。
+- 用户明确说"升版本"或"更新版本号"时才可多次升级。
