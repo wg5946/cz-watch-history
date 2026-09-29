@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         厂长资源 观影历史记录增强版
 // @namespace    https://www.4kcz.com/
-// @version      1.2.2
+// @version      1.2.3
 // @description  为 厂长资源 影视站增加观影历史、播放进度记录、最新集数检测、并支持从历史新窗口打开后自动跳转到上次播放时间
 // @author       wg5945
 // @license      MIT
@@ -42,6 +42,9 @@
         IFRAME_PROGRESS_MESSAGE: 'CZ_HISTORY_IFRAME_PROGRESS',
         IFRAME_RESUME_MESSAGE: 'CZ_HISTORY_IFRAME_RESUME',
         IFRAME_RESUME_ACK_MESSAGE: 'CZ_HISTORY_IFRAME_RESUME_ACK',
+        NEXT_EPISODE_REQUEST_MESSAGE: 'CZ_HISTORY_NEXT_EPISODE_REQUEST',
+        NEXT_EPISODE_RESPONSE_MESSAGE: 'CZ_HISTORY_NEXT_EPISODE_RESPONSE',
+        NEXT_EPISODE_NAVIGATE_MESSAGE: 'CZ_HISTORY_NEXT_EPISODE_NAVIGATE',
         RESUME_TOLERANCE: 3,
         RESUME_PROTECT_MS: 15000,
         RESUME_DISPATCH_INTERVAL: 800,
@@ -104,7 +107,7 @@
     }
 
     // 脚本加载确认（始终输出，仅一行）
-    console.log(`[观影历史] v1.2.1 已注入 ${isPlayerFrame() ? '播放器帧' : '主站'} | ${location.hostname}`);
+    console.log(`[观影历史] v1.2.3 已注入 ${isPlayerFrame() ? '播放器帧' : '主站'} | ${location.hostname}`);
 
     function normalizeUrl(url) {
         try { const u = new URL(url, location.href); u.hash = ''; return u.href; }
@@ -240,6 +243,78 @@
         setTimeout(doSeek, 300); setTimeout(doSeek, 1000); setTimeout(doSeek, 2000);
     }
 
+    let iframeNextEpisodeUrl = '';
+    let iframeNextEpisodeLabel = '';
+    let iframeNextEpisodeButtonTimer = null;
+
+    function requestNextEpisodeInfo() {
+        throttledLog('nextEpisodeRequest', 5000, '请求下一集信息');
+        try {
+            window.top.postMessage({
+                type: CONFIG.NEXT_EPISODE_REQUEST_MESSAGE,
+                time: Date.now()
+            }, '*');
+        } catch (e) { warn('请求下一集信息失败', e); }
+    }
+
+    function activateNextEpisodeButton(button) {
+        if (button.__czzyvNextEpisodeBound) return;
+        button.__czzyvNextEpisodeBound = true;
+        const goNext = event => {
+            if (event) {
+                event.preventDefault();
+                event.stopPropagation();
+            }
+            if (!iframeNextEpisodeUrl) return;
+            try {
+                window.top.postMessage({
+                    type: CONFIG.NEXT_EPISODE_NAVIGATE_MESSAGE,
+                    url: iframeNextEpisodeUrl,
+                    time: Date.now()
+                }, '*');
+            } catch (e) { warn('请求跳转下一集失败', e); }
+        };
+        button.addEventListener('click', goNext);
+        button.addEventListener('keydown', event => {
+            if (event.key === 'Enter' || event.key === ' ') goNext(event);
+        });
+    }
+
+    function ensureNextEpisodeButton() {
+        const controlsList = querySelectorAllDeep('.art-controls', document);
+        for (const controls of controlsList) {
+            let button = controls.querySelector('.cz-history-next-episode');
+            if (!iframeNextEpisodeUrl) {
+                if (button) button.remove();
+                continue;
+            }
+            if (!button) {
+                button = document.createElement('div');
+                button.className = 'art-control cz-history-next-episode hint--rounded hint--top';
+                button.setAttribute('data-index', '80');
+                button.setAttribute('role', 'button');
+                button.setAttribute('tabindex', '0');
+                button.style.cssText = 'display:flex;align-items:center;justify-content:center;width:42px;height:42px;box-sizing:border-box;padding:0;cursor:pointer;color:inherit;white-space:nowrap;';
+                button.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M5 5.5a1 1 0 0 1 1.54-.84l7.2 5.5a1.05 1.05 0 0 1 0 1.68l-7.2 5.5A1 1 0 0 1 5 16.5v-11z"></path><path d="M17 5h2v14h-2z"></path></svg>';
+                const playControl = controls.querySelector('.art-control-playAndPause');
+                if (playControl && playControl.parentElement) {
+                    playControl.parentElement.insertBefore(button, playControl.nextSibling);
+                } else {
+                    const leftControls = controls.querySelector('.art-controls-left');
+                    (leftControls || controls).appendChild(button);
+                }
+                activateNextEpisodeButton(button);
+                throttledLog('nextEpisodeButtonCreated', 5000, '已创建下一集按钮');
+            }
+            const label = iframeNextEpisodeLabel ? `下一集 ${iframeNextEpisodeLabel}` : '下一集';
+            if (!button.querySelector('svg')) {
+                button.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M5 5.5a1 1 0 0 1 1.54-.84l7.2 5.5a1.05 1.05 0 0 1 0 1.68l-7.2 5.5A1.05 1.05 0 0 1 5 16.5v-11z"></path><path d="M17 5h2v14h-2z"></path></svg>';
+            }
+            if (button.getAttribute('aria-label') !== label) button.setAttribute('aria-label', label);
+            if (button.title !== label) button.title = label;
+        }
+    }
+
     function startIframeProgressReporter() {
         log('播放器帧上报器已启动');
         let lastText = '';
@@ -253,14 +328,31 @@
         }
         window.addEventListener('message', function (event) {
             const data = event.data;
-            if (!data || data.type !== CONFIG.IFRAME_RESUME_MESSAGE) return;
+            if (!data) return;
+            if (data.type === CONFIG.NEXT_EPISODE_RESPONSE_MESSAGE) {
+                iframeNextEpisodeUrl = data.available && data.url ? String(data.url) : '';
+                iframeNextEpisodeLabel = data.label ? String(data.label) : '';
+                throttledLog('nextEpisodeResponse', 5000, '收到下一集信息', {
+                    available: !!iframeNextEpisodeUrl,
+                    label: iframeNextEpisodeLabel
+                });
+                ensureNextEpisodeButton();
+                return;
+            }
+            if (data.type !== CONFIG.IFRAME_RESUME_MESSAGE) return;
             const seconds = Number(data.currentTime) || 0;
             log('收到顶层消息 RESUME', { 秒: seconds, 来源: event.origin });
             if (seconds > 0) startIframeSeek(seconds, data.autoPlay !== false);
         });
+        requestNextEpisodeInfo();
+        setTimeout(requestNextEpisodeInfo, 800);
+        setTimeout(requestNextEpisodeInfo, 2000);
         setInterval(() => reportProgress('poll'), CONFIG.IFRAME_REPORT_INTERVAL);
-        const observer = new MutationObserver(() => reportProgress('dom'));
-        if (document.body) observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+        // 不监听整个播放器 DOM：ArtPlayer 会持续修改控件节点，监听会造成高频扫描甚至卡死。
+        // 用低频幂等检查确保播放器重建控件后按钮仍能恢复。
+        if (iframeNextEpisodeButtonTimer) clearInterval(iframeNextEpisodeButtonTimer);
+        iframeNextEpisodeButtonTimer = setInterval(() => ensureNextEpisodeButton(), 1000);
+        log('下一集按钮检查器已启动（每 1 秒一次，未启用播放器 DOM 全量监听）');
 
         // ★ 新增：直接挂 video 事件，比只靠轮询/DOM 变化更可靠
         let lastEventReport = 0;
@@ -286,9 +378,9 @@
         document.addEventListener('canplay', e => {
             if (e.target && e.target.tagName === 'VIDEO' && iframeActiveSeekTarget > 0 && !iframeResumeFinished) startIframeSeek(iframeActiveSeekTarget, true);
         }, true);
-        setTimeout(() => reportProgress('init-0.5s'), 500);
-        setTimeout(() => reportProgress('init-1.5s'), 1500);
-        setTimeout(() => reportProgress('init-3s'), 3000);
+        setTimeout(() => { reportProgress('init-0.5s'); ensureNextEpisodeButton(); }, 500);
+        setTimeout(() => { reportProgress('init-1.5s'); ensureNextEpisodeButton(); }, 1500);
+        setTimeout(() => { reportProgress('init-3s'); ensureNextEpisodeButton(); }, 3000);
         setTimeout(() => {
             const n = querySelectorAllDeep('video', document).length;
             log('3 秒自检：找到 video 元素数量 =', n, n ? '' : '（若为 0，说明播放器结构变化或未加载完）');
@@ -403,10 +495,68 @@
         setTimeout(dispatch, 300); setTimeout(dispatch, 1000); setTimeout(dispatch, 2000);
     }
 
+    function getNextEpisodeInfo() {
+        const links = Array.from(document.querySelectorAll('.juji_list a[href]'));
+        if (!links.length) return null;
+        let currentIndex = links.findIndex(link => link.classList.contains('pbplay'));
+        if (currentIndex < 0) {
+            const currentUrl = normalizeUrl(location.href);
+            currentIndex = links.findIndex(link => normalizeUrl(link.href) === currentUrl);
+        }
+        if (currentIndex < 0) return null;
+        const next = links[currentIndex + 1];
+        if (!next || !next.href) return { url: '', label: '' };
+        return {
+            url: normalizeUrl(next.href),
+            label: String(next.textContent || next.getAttribute('title') || '').replace(/\s+/g, ' ').trim()
+        };
+    }
+
+    function sendNextEpisodeInfo(targetWindow) {
+        if (!targetWindow) return null;
+        const info = getNextEpisodeInfo();
+        throttledLog('nextEpisodeInfo', 5000, '发送下一集信息', {
+            available: !!(info && info.url),
+            label: info && info.label ? info.label : ''
+        });
+        try {
+            targetWindow.postMessage({
+                type: CONFIG.NEXT_EPISODE_RESPONSE_MESSAGE,
+                available: !!(info && info.url),
+                url: info && info.url ? info.url : '',
+                label: info && info.label ? info.label : '',
+                time: Date.now()
+            }, '*');
+        } catch (e) { warn('发送下一集信息失败', e); }
+        return info;
+    }
+
+    function navigateToNextEpisode(url) {
+        const info = getNextEpisodeInfo();
+        if (!info || !info.url || normalizeUrl(url) !== info.url) {
+            warn('下一集地址校验失败，已取消跳转', { requested: url, expected: info && info.url });
+            return;
+        }
+        recordCurrentPlayPage(true);
+        window.location.href = info.url;
+    }
+
     function bindIframeProgressMessage() {
         window.addEventListener('message', function (event) {
             const data = event.data;
             if (!data) return;
+            if (data.type === CONFIG.NEXT_EPISODE_REQUEST_MESSAGE) {
+                const targetWindow = event.source;
+                const info = sendNextEpisodeInfo(targetWindow);
+                if (!info || !info.url) {
+                    [300, 1000, 2500].forEach(delay => setTimeout(() => sendNextEpisodeInfo(targetWindow), delay));
+                }
+                return;
+            }
+            if (data.type === CONFIG.NEXT_EPISODE_NAVIGATE_MESSAGE) {
+                navigateToNextEpisode(data.url);
+                return;
+            }
             if (data.type === CONFIG.IFRAME_RESUME_ACK_MESSAGE) {
                 log('✔ 收到 iframe 跳转完成 ACK', { 秒: data.currentTime });
                 stopResumeDispatcher(); return;
@@ -1271,8 +1421,13 @@
     }
 
     function observePageChange() {
-        const observer = new MutationObserver(() => { bindVideoEvents(); if (isPlayPage()) recordCurrentPlayPage(false); });
-        observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+        // 只在页面结构变化后重新绑定 video 事件。
+        // 不在这里保存历史，避免 renderHistoryList() 修改 DOM 后触发递归保存/重绘。
+        const observer = new MutationObserver(() => {
+            throttledLog('topMutation', 5000, '主页面 DOM 发生变化，重新检查 video 事件');
+            bindVideoEvents();
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
     }
 
     function startIntervalRecord() {
