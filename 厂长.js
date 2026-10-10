@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         厂长资源 观影历史记录增强版
 // @namespace    https://www.4kcz.com/
-// @version      1.2.3
+// @version      1.2.4
 // @description  为 厂长资源 影视站增加观影历史、播放进度记录、最新集数检测、并支持从历史新窗口打开后自动跳转到上次播放时间
 // @author       wg5945
 // @license      MIT
@@ -107,7 +107,7 @@
     }
 
     // 脚本加载确认（始终输出，仅一行）
-    console.log(`[观影历史] v1.2.3 已注入 ${isPlayerFrame() ? '播放器帧' : '主站'} | ${location.hostname}`);
+    console.log(`[观影历史] v1.2.4 已注入 ${isPlayerFrame() ? '播放器帧' : '主站'} | ${location.hostname}`);
 
     function normalizeUrl(url) {
         try { const u = new URL(url, location.href); u.hash = ''; return u.href; }
@@ -284,10 +284,6 @@
         const controlsList = querySelectorAllDeep('.art-controls', document);
         for (const controls of controlsList) {
             let button = controls.querySelector('.cz-history-next-episode');
-            if (!iframeNextEpisodeUrl) {
-                if (button) button.remove();
-                continue;
-            }
             if (!button) {
                 button = document.createElement('div');
                 button.className = 'art-control cz-history-next-episode hint--rounded hint--top';
@@ -306,7 +302,13 @@
                 activateNextEpisodeButton(button);
                 throttledLog('nextEpisodeButtonCreated', 5000, '已创建下一集按钮');
             }
-            const label = iframeNextEpisodeLabel ? `下一集 ${iframeNextEpisodeLabel}` : '下一集';
+            const available = !!iframeNextEpisodeUrl;
+            const label = available ? (iframeNextEpisodeLabel ? `下一集 ${iframeNextEpisodeLabel}` : '下一集') : '暂无下一集';
+            button.setAttribute('aria-disabled', String(!available));
+            button.setAttribute('tabindex', available ? '0' : '-1');
+            button.style.opacity = available ? '1' : '0.35';
+            button.style.cursor = available ? 'pointer' : 'not-allowed';
+            button.style.color = available ? 'inherit' : '#999';
             if (!button.querySelector('svg')) {
                 button.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M5 5.5a1 1 0 0 1 1.54-.84l7.2 5.5a1.05 1.05 0 0 1 0 1.68l-7.2 5.5A1.05 1.05 0 0 1 5 16.5v-11z"></path><path d="M17 5h2v14h-2z"></path></svg>';
             }
@@ -498,18 +500,28 @@
     function getNextEpisodeInfo() {
         const links = Array.from(document.querySelectorAll('.juji_list a[href]'));
         if (!links.length) return null;
-        let currentIndex = links.findIndex(link => link.classList.contains('pbplay'));
-        if (currentIndex < 0) {
-            const currentUrl = normalizeUrl(location.href);
-            currentIndex = links.findIndex(link => normalizeUrl(link.href) === currentUrl);
-        }
+        const currentUrl = normalizeUrl(location.href);
+        const current = links.find(link => normalizeUrl(link.href) === currentUrl)
+            || links.find(link => link.classList.contains('pbplay'));
+        if (!current) return null;
+        // 只在当前播放列表中查找，不能把另一条线路的第一集当作下一集。
+        const list = current.closest('.juji_list');
+        if (!list) return null;
+        const episodeLinks = Array.from(list.querySelectorAll('a[href]'));
+        const currentIndex = episodeLinks.indexOf(current);
         if (currentIndex < 0) return null;
-        const next = links[currentIndex + 1];
+        const next = episodeLinks[currentIndex + 1];
         if (!next || !next.href) return { url: '', label: '' };
-        return {
-            url: normalizeUrl(next.href),
-            label: String(next.textContent || next.getAttribute('title') || '').replace(/\s+/g, ' ').trim()
-        };
+        const url = normalizeUrl(next.href);
+        const label = String(next.textContent || next.getAttribute('title') || '').replace(/\s+/g, ' ').trim();
+        const currentNumber = extractEpisodeNumber(current.textContent || current.getAttribute('title'));
+        const nextNumber = extractEpisodeNumber(label);
+        // 防止列表中的重复链接或回到第一集的链接触发循环播放。
+        if (url === currentUrl || url === normalizeUrl(current.href)
+            || (currentNumber > 0 && nextNumber > 0 && nextNumber <= currentNumber)) {
+            return { url: '', label: '' };
+        }
+        return { url, label };
     }
 
     function sendNextEpisodeInfo(targetWindow) {
