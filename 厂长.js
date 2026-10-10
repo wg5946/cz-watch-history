@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         厂长资源 观影历史记录增强版
 // @namespace    https://www.4kcz.com/
-// @version      1.2.4
+// @version      1.2.5
 // @description  为 厂长资源 影视站增加观影历史、播放进度记录、最新集数检测、并支持从历史新窗口打开后自动跳转到上次播放时间
 // @author       wg5945
 // @license      MIT
@@ -107,7 +107,7 @@
     }
 
     // 脚本加载确认（始终输出，仅一行）
-    console.log(`[观影历史] v1.2.4 已注入 ${isPlayerFrame() ? '播放器帧' : '主站'} | ${location.hostname}`);
+    console.log(`[观影历史] v1.2.5 已注入 ${isPlayerFrame() ? '播放器帧' : '主站'} | ${location.hostname}`);
 
     function normalizeUrl(url) {
         try { const u = new URL(url, location.href); u.hash = ''; return u.href; }
@@ -397,7 +397,24 @@
         try {
             const raw = localStorage.getItem(CONFIG.STORAGE_KEY);
             const list = raw ? JSON.parse(raw) : [];
-            return Array.isArray(list) ? dedupeHistoryBySeries(list) : [];
+            if (!Array.isArray(list)) return [];
+            const deduped = dedupeHistoryBySeries(list);
+            let changed = deduped.length !== list.length;
+            for (const item of deduped) {
+                const latest = Number(item.latestEpisodeNumber) || 0;
+                const watched = Number(item.watchedEpisodeNumber) || 0;
+                if (latest > 0 && watched > latest) {
+                    item.watchedEpisodeNumber = latest;
+                    changed = true;
+                }
+                const episode = extractEpisodeNumber(item.episodeText);
+                if (latest > 0 && episode > latest) {
+                    item.episodeText = `第${latest}集`;
+                    changed = true;
+                }
+            }
+            if (changed) saveHistory(deduped);
+            return deduped;
         } catch (e) { return []; }
     }
     function saveHistory(list) {
@@ -603,7 +620,37 @@
             .replace(/[-_].*$/g, '').replace(/\s+/g, ' ').trim() || location.href;
     }
 
+    function getCurrentEpisodeLinkFromDocument(doc = document) {
+        if (!doc || !doc.querySelectorAll) return null;
+        let links = [];
+        try { links = Array.from(doc.querySelectorAll('.juji_list a[href]')); } catch (e) {}
+        if (!links.length) return null;
+
+        const currentUrl = normalizeUrl(location.href);
+        let currentIndex = links.findIndex(link => {
+            try { return normalizeUrl(link.href || link.getAttribute('href')) === currentUrl; } catch (e) { return false; }
+        });
+        if (currentIndex < 0) currentIndex = links.findIndex(link => link.classList && link.classList.contains('pbplay'));
+        return currentIndex >= 0 ? links[currentIndex] : null;
+    }
+
+    function getCurrentEpisodeLabelFromDocument(doc = document) {
+        const currentLink = getCurrentEpisodeLinkFromDocument(doc);
+        if (!currentLink) return '';
+        return String(currentLink.textContent || currentLink.innerText || currentLink.getAttribute('title') || '')
+            .replace(/\s+/g, ' ').trim();
+    }
+
+    function getCurrentEpisodeNumberFromDocument(doc = document) {
+        return extractEpisodeNumber(getCurrentEpisodeLabelFromDocument(doc));
+    }
+
     function getEpisodeText() {
+        const playlistEpisodeLabel = getCurrentEpisodeLabelFromDocument();
+        if (playlistEpisodeLabel) {
+            const playlistEpisodeNumber = extractEpisodeNumber(playlistEpisodeLabel);
+            return playlistEpisodeNumber > 0 ? `第${playlistEpisodeNumber}集` : playlistEpisodeLabel;
+        }
         const ptitEpisode = document.querySelector('.mi_cont .paycon h3.ptit span, h3.ptit span');
         if (ptitEpisode && ptitEpisode.textContent.trim()) return ptitEpisode.textContent.trim();
         const currentEpisode = document.querySelector('.juji_list .pbplay');
@@ -642,6 +689,12 @@
         if (match) return chineseNumberToInt(match[1]);
         if (/^\d{1,4}$/.test(text)) return parseInt(text, 10) || 0;
         return 0;
+    }
+
+    function capWatchedEpisodeNumber(watched, latest) {
+        const watchedNumber = Number(watched) || 0;
+        const latestNumber = Number(latest) || 0;
+        return latestNumber > 0 ? Math.min(watchedNumber, latestNumber) : watchedNumber;
     }
 
     function getEpisodeDetectRoot(doc = document) {
@@ -888,6 +941,13 @@
                         currentList[index].latestEpisodeNumber = latest.number || Number(cur.latestEpisodeNumber) || 0;
                         currentList[index].latestEpisodeText = latest.text || cur.latestEpisodeText || '';
                         currentList[index].latestEpisodeCheckedAt = now;
+                        currentList[index].watchedEpisodeNumber = capWatchedEpisodeNumber(
+                            currentList[index].watchedEpisodeNumber,
+                            currentList[index].latestEpisodeNumber
+                        );
+                        if (extractEpisodeNumber(currentList[index].episodeText) > currentList[index].latestEpisodeNumber) {
+                            currentList[index].episodeText = `第${currentList[index].latestEpisodeNumber}集`;
+                        }
                     }
                     if (needPoster && poster) {
                         currentList[index].poster = poster;
@@ -997,6 +1057,9 @@
         } else {
             watchedEpisodeNumber = Math.max(newWatchedEp, latestNum);
         }
+        // 播放列表中的特别篇可能让网页标题出现虚假的连续编号；
+        // 最新集数是同一播放列表的正片上限，用它校正历史中的旧编号。
+        watchedEpisodeNumber = capWatchedEpisodeNumber(watchedEpisodeNumber, latestNum);
 
         const detailUrl = (oldItem && oldItem.detailUrl) ? oldItem.detailUrl : buildDetailUrl(location.href);
         const isFirstRecord = !oldItem;
@@ -1295,7 +1358,10 @@
             //   2) 在看集数 = 更新至集数 且 本集观看进度 < 80% → 还没看完最后一集
             //   满足任一条件时，给"已看到的集数"徽章加特殊黄色样式。
             const latestNum = Number(item.latestEpisodeNumber) || 0;
-            const realWatched = extractEpisodeNumber(item.episodeText) || 0;
+            let realWatched = extractEpisodeNumber(item.episodeText) || 0;
+            if (latestNum > 0 && realWatched > latestNum) {
+                realWatched = latestNum;
+            }
             const durationNum = Number(item.duration) || 0;
             const unfinished = shouldShowLatest && latestNum > 0 && realWatched > 0 && (
                 realWatched < latestNum ||
@@ -1316,6 +1382,10 @@
                 : '';
 
             let episodeText = String(item.episodeText || '').trim();
+            const itemEpisodeNumber = extractEpisodeNumber(episodeText);
+            if (latestNum > 0 && itemEpisodeNumber > latestNum) {
+                episodeText = `第${latestNum}集`;
+            }
             let mainTitle = String(item.movieTitle || '').trim();
             if (!mainTitle) {
                 mainTitle = String(item.title || '').trim();

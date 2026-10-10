@@ -7,7 +7,8 @@ const { test } = require('node:test');
 const source = fs.readFileSync(path.join(__dirname, '../厂长.js'), 'utf8');
 const functionNames = [
     'normalizeUrl', 'chineseNumberToInt', 'extractEpisodeNumber',
-    'getNextEpisodeInfo', 'navigateToNextEpisode',
+    'getCurrentEpisodeLinkFromDocument', 'getCurrentEpisodeLabelFromDocument',
+    'getCurrentEpisodeNumberFromDocument', 'getNextEpisodeInfo', 'navigateToNextEpisode',
     'activateNextEpisodeButton', 'ensureNextEpisodeButton'
 ];
 const functions = functionNames.map(name => {
@@ -17,6 +18,11 @@ const functions = functionNames.map(name => {
     return source.slice(start, end);
 }).join('\n');
 
+const episodes = [
+    ['/v_play/1.html', '第1集'],
+    ['/v_play/2.html', '第2集'],
+    ['/v_play/3.html', '第3集'],
+];
 function setup(groups, currentUrl) {
     const links = groups.flatMap(group => {
         const list = { querySelectorAll: () => episodes };
@@ -58,11 +64,17 @@ function setup(groups, currentUrl) {
     return { context, messages, getButton: () => button };
 }
 
-const episodes = [
-    ['/v_play/1.html', '第1集'],
-    ['/v_play/2.html', '第2集'],
-    ['/v_play/3.html', '第3集'],
-];
+test('特别篇保留播放列表原始名称，不显示为前一集编号', () => {
+    const groups = [[
+        ['/v_play/124.html', '124'],
+        ['/v_play/a-up.html', '虚天战纪-A-上'],
+        ['/v_play/a-down.html', '虚天战纪-A-下'],
+        ['/v_play/125.html', '125'],
+    ]];
+    const { context } = setup(groups, '/v_play/a-down.html');
+    assert.equal(context.getCurrentEpisodeLabelFromDocument(), '虚天战纪-A-下');
+    assert.equal(context.getCurrentEpisodeNumberFromDocument(), 0);
+});
 
 test('普通集数返回当前线路下一集，并允许跳转', () => {
     const { context } = setup([episodes], '/v_play/2.html');
