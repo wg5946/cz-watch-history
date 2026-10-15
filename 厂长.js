@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         厂长资源 观影历史记录增强版
 // @namespace    https://www.4kcz.com/
-// @version      1.3.0
+// @version      1.3.1
 // @description  为 厂长资源 影视站增加观影历史、播放进度记录、最新集数检测、并支持从历史新窗口打开后自动跳转到上次播放时间
 // @author       wg5945
 // @license      MIT
@@ -48,6 +48,10 @@
         NEXT_EPISODE_NAVIGATE_MESSAGE: 'CZ_HISTORY_NEXT_EPISODE_NAVIGATE',
         NEXT_EPISODE_LOAD_MESSAGE: 'CZ_HISTORY_NEXT_EPISODE_LOAD',
         NEXT_EPISODE_LOAD_ACK_MESSAGE: 'CZ_HISTORY_NEXT_EPISODE_LOAD_ACK',
+        NEXT_EPISODE_CONFIRM_MESSAGE: 'CZ_HISTORY_NEXT_EPISODE_CONFIRM',
+        STREAM_PROBE_TOKEN_PREFIX: '#czprobe_',
+        PROBE_STREAM_MESSAGE: 'CZ_HISTORY_STREAM_PROBE_RESULT',
+        PROBE_RESULT_KEY: 'czzyv_probe_result',
         PLAY_SETTINGS_REQUEST_MESSAGE: 'CZ_HISTORY_PLAY_SETTINGS_REQUEST',
         PLAY_SETTINGS_RESPONSE_MESSAGE: 'CZ_HISTORY_PLAY_SETTINGS_RESPONSE',
         PLAY_SETTINGS_UPDATE_MESSAGE: 'CZ_HISTORY_PLAY_SETTINGS_UPDATE',
@@ -67,6 +71,7 @@
 
     let lastSaveAt = 0;
     let pendingNextFallback = null;
+    let streamProbe = null;
     let latestIframeProgress = null;
     let pendingResumeTarget = null;
     let pendingResumeStartAt = 0;
@@ -114,7 +119,7 @@
     }
 
     // 脚本加载确认（始终输出，仅一行）
-    console.log(`[观影历史] v1.3.0 已注入 ${isPlayerFrame() ? '播放器帧' : '主站'} | ${location.hostname}`);
+    console.log(`[观影历史] v1.3.1 已注入 ${isPlayerFrame() ? '播放器帧' : '主站'} | ${location.hostname}`);
 
     function normalizeUrl(url) {
         try { const u = new URL(url, location.href); u.hash = ''; return u.href; }
@@ -427,6 +432,33 @@
         }
     }
 
+    // 探测解锁的真实播放源由播放器自己直接切换（探测页与播放器同源，localStorage 直通）
+    async function switchFromProbe(payload) {
+        if (!payload || !payload.url) return;
+        if (iframeNextEpisodeSwitching) return;
+        iframeNextEpisodeSwitching = true;
+        try {
+            const streamUrl = String(payload.url);
+            const type = detectStreamType(streamUrl);
+            if (!applyNextEpisodePlayerSource(type, streamUrl, payload.pageUrl)) throw new Error('ArtPlayer 实例不可用');
+            log('✔ 探测到播放源，已在当前播放器无缝换源', { type: type || '(自动)' });
+            try {
+                window.top.postMessage({
+                    type: CONFIG.NEXT_EPISODE_CONFIRM_MESSAGE,
+                    token: payload.token || '',
+                    pageUrl: payload.pageUrl || '',
+                    time: Date.now()
+                }, '*');
+            } catch (e) {}
+            sendNextEpisodeLoadAck(true, 'probe-ok');
+        } catch (e) {
+            warn('探测源换源失败', e && e.message);
+            try { sendNextEpisodeLoadAck(false, String((e && e.message) || e)); } catch (e2) {}
+        } finally {
+            iframeNextEpisodeSwitching = false;
+        }
+    }
+
     // === 播放设置 UI & 行为（连续播放 / 跳过片头片尾）===
     function requestPlaySettings() {
         try {
@@ -682,6 +714,20 @@
         setTimeout(requestPlaySettings, 800);
         setTimeout(requestPlaySettings, 2000);
         setInterval(() => reportProgress('poll'), CONFIG.IFRAME_REPORT_INTERVAL);
+        // 播放源探测结果由真实播放器直接消费：同 plaa 域，探测页把结果写进 localStorage，
+        // 真实播放器轮询到后自行无缝换源（无需跨框架传输），再发 CONFIRM 给主站收尾 URL。
+        setInterval(() => {
+            if (!window.art) return; // 只有真实播放器才消费探测结果
+            let raw = null;
+            try { raw = localStorage.getItem(CONFIG.PROBE_RESULT_KEY); } catch (e) {}
+            if (!raw) return;
+            try { localStorage.removeItem(CONFIG.PROBE_RESULT_KEY); } catch (e) {}
+            let payload = null;
+            try { payload = JSON.parse(raw); } catch (e) {}
+            if (!payload) return;
+            if (Date.now() - (Number(payload.time) || 0) > 20000) return; // 过期结果直接丢弃
+            switchFromProbe(payload);
+        }, 600);
         // 不监听整个播放器 DOM：ArtPlayer 会持续修改控件节点，监听会造成高频扫描甚至卡死。
         // 用低频幂等检查确保播放器重建控件后按钮仍能恢复。
         if (iframeNextEpisodeButtonTimer) clearInterval(iframeNextEpisodeButtonTimer);
@@ -743,7 +789,57 @@
         }, 3000);
     }
 
-    if (isPlayerFrame()) { startIframeProgressReporter(); return; }
+    // === 加密线路播放源探测（在顶层创建的隐藏 iframe 内运行）===
+    // 读取当前播放器页里 window.art 的真实播放地址，回报给主站用于无缝换源。
+    function runStreamProbe() {
+        const h = String(location.hash || '').replace(CONFIG.STREAM_PROBE_TOKEN_PREFIX, '');
+        const sep = h.indexOf('|');
+        const token = sep >= 0 ? h.slice(0, sep) : h;
+        let pageUrl = '';
+        if (sep >= 0) { try { pageUrl = decodeURIComponent(h.slice(sep + 1)); } catch (e) {} }
+        const deadline = Date.now() + 6000;
+        function report(result) {
+            const payload = {
+                type: CONFIG.PROBE_STREAM_MESSAGE,
+                token: token,
+                url: result ? result.url : '',
+                type: result ? result.type : '',
+                pageUrl: pageUrl,
+                time: Date.now()
+            };
+            // 同源 localStorage 直通：真实播放器（与探测页同 plaa 域）轮询后直接换源
+            try { localStorage.setItem(CONFIG.PROBE_RESULT_KEY, JSON.stringify(payload)); } catch (e) { warn('探测结果写入失败', e); }
+        }
+        function poll() {
+            let result = null;
+            const art = window.art;
+            if (art) {
+                const hls = art.hls;
+                if (hls && hls.url) result = { url: hls.url, type: 'hls' };
+                else if (art.option && art.option.url && !/^blob:/i.test(String(art.option.url))) result = { url: art.option.url, type: detectStreamType(art.option.url) };
+                else if (art.url && !/^blob:/i.test(String(art.url)) && !/^about:/i.test(String(art.url))) result = { url: art.url, type: detectStreamType(art.url) };
+            }
+            // 兜底：直接从 video 元素读当前源
+            if (!result) {
+                const videos = querySelectorAllDeep('video', document);
+                const v = videos && videos[0];
+                const cs = v && v.currentSrc;
+                if (cs && !/^blob:/i.test(cs) && !/^about:/i.test(cs)) result = { url: cs, type: detectStreamType(cs) };
+            }
+            if (result) { report(result); return; }
+            if (Date.now() > deadline) { report(null); return; }
+            setTimeout(poll, 200);
+        }
+        poll();
+    }
+
+    if (isPlayerFrame()) {
+        if (String(location.hash || '').indexOf(CONFIG.STREAM_PROBE_TOKEN_PREFIX) === 0) {
+            runStreamProbe();
+            return;
+        }
+        startIframeProgressReporter(); return;
+    }
     if (!isMainSiteHost()) { log('非主站且非播放器帧，脚本退出'); return; }
 
     // === 历史存取 ===
@@ -973,8 +1069,8 @@
         } catch (e) {}
     }
 
-    // 优先尝试在当前播放器 iframe 内无缝换源（保留全屏与播放状态）；
-    // 只有下一集播放器地址里带明文视频源时才走此路径，否则回退整页跳转。
+    // 优先尝试在当前播放器 iframe 内无缝换源（保留全屏与播放状态）。
+    // 明文源直接换源；加密线路用隐藏 iframe 探测真实播放源；都不行则回退整页跳转。
     async function navigateToNextEpisode(url, sourceWindow) {
         const info = getNextEpisodeInfo();
         if (!info || !info.url || normalizeUrl(url) !== info.url) {
@@ -983,41 +1079,75 @@
         }
         recordCurrentPlayPage(true);
 
+        let nextPlayerUrl = '';
         let nextStreamUrl = '';
         try {
             const html = await fetchTextWithTimeout(info.url);
-            nextStreamUrl = extractDirectStreamFromPlayerUrl(extractPlayerUrlFromPlayHtml(html));
+            nextPlayerUrl = extractPlayerUrlFromPlayHtml(html);
+            nextStreamUrl = extractDirectStreamFromPlayerUrl(nextPlayerUrl);
         } catch (e) { warn('获取下一集播放器地址失败，将整页跳转', e); }
 
         if (sourceWindow && nextStreamUrl) {
-            pendingNextFallback = { url: info.url, sourceWindow: sourceWindow, time: Date.now() };
-            try {
-                sourceWindow.postMessage({
-                    type: CONFIG.NEXT_EPISODE_LOAD_MESSAGE,
-                    streamUrl: nextStreamUrl,
-                    pageUrl: info.url,
-                    time: Date.now()
-                }, '*');
-            } catch (e) {
-                warn('发送无缝换源请求失败，将整页跳转', e);
-                pendingNextFallback = null;
-                window.location.href = info.url;
-                return;
-            }
-            try { history.replaceState(null, '', info.url); } catch (e) { warn('更新地址栏失败', e); }
-            updatePlaylistHighlight(info.url);
-            try { sendNextEpisodeInfo(sourceWindow); } catch (e) {}
-            // 3 秒内未收到“失败”回执即视为换源成功；只有收到失败回执才整页跳转
-            setTimeout(() => {
-                if (pendingNextFallback && pendingNextFallback.url === info.url) {
-                    pendingNextFallback = null;
-                    log('下一集无缝换源已处理（未收到失败回执）');
-                }
-            }, 3000);
+            sendSeamlessNext(sourceWindow, nextStreamUrl, info.url);
+        } else if (sourceWindow && nextPlayerUrl) {
+            // 加密线路（如 alistdr 前缀）：用隐藏 iframe 加载下一集播放器页拿到真实播放源
+            startStreamProbe(nextPlayerUrl, info.url, sourceWindow);
         } else {
+            warn('下一集无法无缝换源（未取到可直接播放的源），回退整页跳转', { url: info.url });
             window.location.href = info.url;
         }
     }
+
+    function sendSeamlessNext(sourceWindow, streamUrl, pageUrl) {
+        pendingNextFallback = { url: pageUrl, sourceWindow: sourceWindow, time: Date.now() };
+        try {
+            sourceWindow.postMessage({
+                type: CONFIG.NEXT_EPISODE_LOAD_MESSAGE,
+                streamUrl: streamUrl,
+                pageUrl: pageUrl,
+                time: Date.now()
+            }, '*');
+        } catch (e) {
+            warn('发送无缝换源请求失败，将整页跳转', e);
+            pendingNextFallback = null;
+            window.location.href = pageUrl;
+            return;
+        }
+        try { history.replaceState(null, '', pageUrl); } catch (e) { warn('更新地址栏失败', e); }
+        updatePlaylistHighlight(pageUrl);
+        try { sendNextEpisodeInfo(sourceWindow); } catch (e) {}
+        // 3 秒内未收到“失败”回执即视为换源成功；只有收到失败回执才整页跳转
+        setTimeout(() => {
+            if (pendingNextFallback && pendingNextFallback.url === pageUrl) {
+                pendingNextFallback = null;
+                log('下一集无缝换源已处理（未收到失败回执）');
+            }
+        }, 3000);
+    }
+
+    // 加密线路探测：在主站上下文里新建隐藏 iframe 加载播放器页（Referer 为主站，py.php 才放行），
+    // 探测页内注入的脚本读取 window.art 的真实播放地址回报主站，用于无缝换源。
+    // 结果通过两条通道回报：postMessage（重试）+ window.name（跨域可读，轮询读取）。
+    function startStreamProbe(playerUrl, pageUrl, sourceWindow) {
+        if (streamProbe) { try { streamProbe.iframe.remove(); } catch (e) {} }
+        const token = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        const probe = document.createElement('iframe');
+        probe.setAttribute('aria-hidden', 'true');
+        probe.style.cssText = 'display:none;width:0;height:0;border:0;';
+        const timer = setTimeout(() => {
+            if (streamProbe && streamProbe.iframe === probe) {
+                streamProbe = null;
+                try { probe.remove(); } catch (e) {}
+                warn('下一集播放源探测超时，回退整页跳转', { url: pageUrl });
+                window.location.href = pageUrl;
+            }
+        }, 7000);
+        streamProbe = { iframe: probe, sourceWindow: sourceWindow, pageUrl: pageUrl, timer: timer, token: token };
+        probe.src = playerUrl + CONFIG.STREAM_PROBE_TOKEN_PREFIX + token + '|' + encodeURIComponent(pageUrl);
+        document.body.appendChild(probe);
+        log('已启动下一集播放源探测', { token: token, playerUrl: (playerUrl || '').slice(0, 90) });
+    }
+
 
     function bindIframeProgressMessage() {
         window.addEventListener('message', function (event) {
@@ -1060,6 +1190,20 @@
                     window.location.href = fb.url;
                 } else if (pendingNextFallback) {
                     pendingNextFallback = null;
+                }
+                return;
+            }
+            if (data.type === CONFIG.NEXT_EPISODE_CONFIRM_MESSAGE) {
+                if (streamProbe && data.token === streamProbe.token) {
+                    const sp = streamProbe;
+                    streamProbe = null;
+                    clearTimeout(sp.timer);
+                    try { sp.iframe.remove(); } catch (e) {}
+                    const pageUrl = data.pageUrl ? String(data.pageUrl) : sp.pageUrl;
+                    try { history.replaceState(null, '', pageUrl); } catch (e) { warn('更新地址栏失败', e); }
+                    updatePlaylistHighlight(pageUrl);
+                    try { sendNextEpisodeInfo(sp.sourceWindow); } catch (e) {}
+                    log('下一集已无缝切换', { url: pageUrl });
                 }
                 return;
             }
