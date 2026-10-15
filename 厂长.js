@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         厂长资源 观影历史记录增强版
 // @namespace    https://www.4kcz.com/
-// @version      1.3.1
+// @version      1.3.2
 // @description  为 厂长资源 影视站增加观影历史、播放进度记录、最新集数检测、并支持从历史新窗口打开后自动跳转到上次播放时间
 // @author       wg5945
 // @license      MIT
@@ -119,7 +119,7 @@
     }
 
     // 脚本加载确认（始终输出，仅一行）
-    console.log(`[观影历史] v1.3.1 已注入 ${isPlayerFrame() ? '播放器帧' : '主站'} | ${location.hostname}`);
+    console.log(`[观影历史] v1.3.2 已注入 ${isPlayerFrame() ? '播放器帧' : '主站'} | ${location.hostname}`);
 
     function normalizeUrl(url) {
         try { const u = new URL(url, location.href); u.hash = ''; return u.href; }
@@ -667,6 +667,77 @@
         log('跳过片尾', { 距结尾: formatSeconds(skipEndOffset), 从: formatSeconds(ct), 至: formatSeconds(target) });
     }
 
+    // === 全屏浮层（-剩余时间 · 系统时钟，Movist Pro 样式）===
+    let fsOverlay = null;
+
+    function getOverlayHost() {
+        const art = window.art;
+        if (art && art.template && art.template.$player) return art.template.$player;
+        return document.querySelector('.art-video-player') || null;
+    }
+
+    function ensureFullscreenTimeOverlay() {
+        const host = getOverlayHost();
+        if (!host) return fsOverlay = null;
+        if (fsOverlay && fsOverlay.isConnected && fsOverlay.parentElement === host) {
+            // ArtPlayer 可能重建 stage：父节点变了就重建，保证浮层挂在新 stage 上
+            return fsOverlay;
+        }
+        const el = document.createElement('div');
+        el.id = 'czzyv-fs-time';
+        el.setAttribute('aria-hidden', 'true');
+        el.innerHTML = '<span class="cz-fs-remain">-0:00</span><span class="cz-fs-sep">/</span><span class="cz-fs-clock">00:00</span>';
+        if (!document.getElementById('czzyv-fs-time-style')) {
+            const style = document.createElement('style');
+            style.id = 'czzyv-fs-time-style';
+            style.textContent = `
+                #czzyv-fs-time{position:absolute;top:10px;right:10px;z-index:2147483000;display:none;align-items:center;
+                    padding:7px 10px;background:rgba(20,20,20,.9);border-radius:2px;
+                    font:400 24px/1 -apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;
+                    letter-spacing:.2px;color:rgba(255,255,255,.96);user-select:none;pointer-events:none;white-space:nowrap;
+                    box-shadow:0 1px 3px rgba(0,0,0,.2)}
+                #czzyv-fs-time .cz-fs-remain{font-variant-numeric:tabular-nums;color:rgba(255,255,255,.96)}
+                #czzyv-fs-time .cz-fs-sep{margin:0 9px;color:rgba(255,255,255,.55);font-weight:300}
+                #czzyv-fs-time .cz-fs-clock{font-variant-numeric:tabular-nums;color:rgba(255,255,255,.72)}
+            `;
+            document.head.appendChild(style);
+        }
+        host.appendChild(el);
+        fsOverlay = el;
+        return el;
+    }
+
+    function isFullscreenActive() {
+        return !!(document.fullscreenElement || document.webkitFullscreenElement) ||
+            !!(window.art && (art.fullscreen === true || art.fullscreenWeb === true));
+    }
+
+    function updateFullscreenTimeOverlay() {
+        const el = ensureFullscreenTimeOverlay();
+        if (!el) return;
+        if (!isFullscreenActive()) { el.style.display = 'none'; return; }
+        const video = getIframeVideo();
+        const ct = video && Number.isFinite(video.currentTime) ? video.currentTime : 0;
+        const dur = video && Number.isFinite(video.duration) ? video.duration : 0;
+        const remainEl = el.querySelector('.cz-fs-remain');
+        const clockEl = el.querySelector('.cz-fs-clock');
+        const remain = dur > 0 ? Math.max(0, dur - ct) : 0;
+        if (remainEl) remainEl.textContent = dur > 0 ? '-' + formatSeconds(remain) : '--:--';
+        if (clockEl) {
+            const now = new Date();
+            const hh = String(now.getHours()).padStart(2, '0');
+            const mm = String(now.getMinutes()).padStart(2, '0');
+            clockEl.textContent = hh + ':' + mm;
+        }
+        el.style.display = 'flex';
+    }
+
+    function startFullscreenTimeOverlay() {
+        ensureFullscreenTimeOverlay();
+        setInterval(updateFullscreenTimeOverlay, 400);
+        log('全屏进度浮层已启动');
+    }
+
     function startIframeProgressReporter() {
         log('播放器帧上报器已启动');
         let lastText = '';
@@ -787,6 +858,7 @@
             const n = querySelectorAllDeep('video', document).length;
             log('3 秒自检：找到 video 元素数量 =', n, n ? '' : '（若为 0，说明播放器结构变化或未加载完）');
         }, 3000);
+        startFullscreenTimeOverlay();
     }
 
     // === 加密线路播放源探测（在顶层创建的隐藏 iframe 内运行）===
