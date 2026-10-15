@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         厂长资源 观影历史记录增强版
 // @namespace    https://www.4kcz.com/
-// @version      1.2.6
+// @version      1.3.0
 // @description  为 厂长资源 影视站增加观影历史、播放进度记录、最新集数检测、并支持从历史新窗口打开后自动跳转到上次播放时间
 // @author       wg5945
 // @license      MIT
@@ -34,6 +34,7 @@
         // 已知播放器域名；实际判定不再依赖此列表（见 isPlayerFrame），仅作参考
         PLAYER_HOSTS: ['plala.py1080p.com', 'py1080p.com'],
         STORAGE_KEY: 'CZzyv_Watch_History_v1',
+        PLAY_SETTINGS_STORAGE_KEY: 'CZzyv_Play_Settings_v1',
         RESUME_STORAGE_KEY: 'CZzyv_Watch_History_Resume_Target_v1',
         MAX_HISTORY: 200,
         PLAY_PAGE_REG: /\/v_play\/[^/]+\.html/i,
@@ -47,6 +48,9 @@
         NEXT_EPISODE_NAVIGATE_MESSAGE: 'CZ_HISTORY_NEXT_EPISODE_NAVIGATE',
         NEXT_EPISODE_LOAD_MESSAGE: 'CZ_HISTORY_NEXT_EPISODE_LOAD',
         NEXT_EPISODE_LOAD_ACK_MESSAGE: 'CZ_HISTORY_NEXT_EPISODE_LOAD_ACK',
+        PLAY_SETTINGS_REQUEST_MESSAGE: 'CZ_HISTORY_PLAY_SETTINGS_REQUEST',
+        PLAY_SETTINGS_RESPONSE_MESSAGE: 'CZ_HISTORY_PLAY_SETTINGS_RESPONSE',
+        PLAY_SETTINGS_UPDATE_MESSAGE: 'CZ_HISTORY_PLAY_SETTINGS_UPDATE',
         RESUME_TOLERANCE: 3,
         RESUME_PROTECT_MS: 15000,
         RESUME_DISPATCH_INTERVAL: 800,
@@ -110,7 +114,7 @@
     }
 
     // 脚本加载确认（始终输出，仅一行）
-    console.log(`[观影历史] v1.2.6 已注入 ${isPlayerFrame() ? '播放器帧' : '主站'} | ${location.hostname}`);
+    console.log(`[观影历史] v1.3.0 已注入 ${isPlayerFrame() ? '播放器帧' : '主站'} | ${location.hostname}`);
 
     function normalizeUrl(url) {
         try { const u = new URL(url, location.href); u.hash = ''; return u.href; }
@@ -188,6 +192,7 @@
     // === iframe 播放器通信 ===
     let iframeActiveSeekTimer = null, iframeActiveSeekTarget = 0, iframeSeekAttemptCount = 0;
     let iframeLastResumeKey = '', iframeResumeFinished = false;
+    let resumeSeekActive = false;
 
     function sendIframeResumeAck(seconds) {
         log('回执跳转完成 ACK', { 目标秒: seconds });
@@ -208,6 +213,7 @@
         const resumeKey = `${Math.floor(seconds)}`;
         if (iframeResumeFinished && iframeLastResumeKey === resumeKey) { log('该目标已跳转完成，忽略重复请求'); return; }
         iframeLastResumeKey = resumeKey; iframeResumeFinished = false;
+        resumeSeekActive = true;
         iframeActiveSeekTarget = seconds; iframeSeekAttemptCount = 0;
         if (iframeActiveSeekTimer) { clearInterval(iframeActiveSeekTimer); iframeActiveSeekTimer = null; }
         function doSeek() {
@@ -215,7 +221,7 @@
             const videos = querySelectorAllDeep('video', document);
             if (!videos.length) {
                 if (iframeSeekAttemptCount % 10 === 0) log('跳转等待中：页面尚无 video 元素', { 第几次: iframeSeekAttemptCount });
-                if (iframeSeekAttemptCount >= 60) { warn('跳转放弃：60 次仍未找到 video'); clearInterval(iframeActiveSeekTimer); iframeActiveSeekTimer = null; }
+                if (iframeSeekAttemptCount >= 60) { warn('跳转放弃：60 次仍未找到 video'); resumeSeekActive = false; clearInterval(iframeActiveSeekTimer); iframeActiveSeekTimer = null; }
                 return;
             }
             let finished = false;
@@ -237,6 +243,7 @@
             if (finished || iframeSeekAttemptCount >= 60) {
                 log(finished ? '跳转成功' : '跳转超时结束', { 目标秒: iframeActiveSeekTarget, 尝试次数: iframeSeekAttemptCount });
                 iframeResumeFinished = true;
+                resumeSeekActive = false;
                 if (iframeActiveSeekTimer) { clearInterval(iframeActiveSeekTimer); iframeActiveSeekTimer = null; }
                 sendIframeResumeAck(iframeActiveSeekTarget);
             }
@@ -251,6 +258,29 @@
     let iframeNextEpisodeButtonTimer = null;
     let iframeNextEpisodeSwitching = false;
     let iframeLastNextClickAt = 0;
+
+    // === 播放设置（连续播放 / 跳过片头片尾）===
+    let playSettings = { autoPlayNext: true, skipIntroOutro: false, skipStart: 0, skipEnd: 0 };
+    let playSettingsSeriesKey = '';
+    let playSettingsButton = null;
+    let playSettingsPanel = null;
+    let skipStartAppliedForSrc = '';
+    let skipEndAppliedForSrc = '';
+
+    function sendNextEpisodeNavigateRequest() {
+        const now = Date.now();
+        if (!iframeNextEpisodeUrl || iframeNextEpisodeSwitching) return false;
+        if (now - iframeLastNextClickAt < 1500) return false;
+        iframeLastNextClickAt = now;
+        try {
+            window.top.postMessage({
+                type: CONFIG.NEXT_EPISODE_NAVIGATE_MESSAGE,
+                url: iframeNextEpisodeUrl,
+                time: Date.now()
+            }, '*');
+            return true;
+        } catch (e) { warn('请求跳转下一集失败', e); return false; }
+    }
 
     function requestNextEpisodeInfo() {
         try {
@@ -269,17 +299,7 @@
                 event.preventDefault();
                 event.stopPropagation();
             }
-            if (!iframeNextEpisodeUrl || iframeNextEpisodeSwitching) return;
-            const now = Date.now();
-            if (now - iframeLastNextClickAt < 1500) return;
-            iframeLastNextClickAt = now;
-            try {
-                window.top.postMessage({
-                    type: CONFIG.NEXT_EPISODE_NAVIGATE_MESSAGE,
-                    url: iframeNextEpisodeUrl,
-                    time: Date.now()
-                }, '*');
-            } catch (e) { warn('请求跳转下一集失败', e); }
+            sendNextEpisodeNavigateRequest();
         };
         button.addEventListener('click', goNext);
         button.addEventListener('keydown', event => {
@@ -407,6 +427,214 @@
         }
     }
 
+    // === 播放设置 UI & 行为（连续播放 / 跳过片头片尾）===
+    function requestPlaySettings() {
+        try {
+            window.top.postMessage({ type: CONFIG.PLAY_SETTINGS_REQUEST_MESSAGE, time: Date.now() }, '*');
+        } catch (e) {}
+    }
+
+    function sendPlaySettingsPatch(patch) {
+        Object.assign(playSettings, patch);
+        renderPlaySettingsPanel();
+        try {
+            window.top.postMessage({
+                type: CONFIG.PLAY_SETTINGS_UPDATE_MESSAGE,
+                seriesKey: playSettingsSeriesKey,
+                patch: patch || {},
+                time: Date.now()
+            }, '*');
+        } catch (e) { warn('保存播放设置失败', e); }
+    }
+
+    function getCurrentVideoTime() {
+        const video = getIframeVideo();
+        return (video && Number.isFinite(video.currentTime)) ? video.currentTime : 0;
+    }
+
+    function ensurePlaySettingsStyle() {
+        if (document.getElementById('czzyv-play-settings-style')) return;
+        const style = document.createElement('style');
+        style.id = 'czzyv-play-settings-style';
+        style.textContent = `
+            #czzyv-play-settings-panel{position:absolute;right:12px;bottom:80px;width:250px;background:rgba(10,10,10,.94);color:#e7e9ee;border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.55),inset 0 0 0 1px rgba(255,255,255,.08);z-index:300;font-size:13px;overflow:hidden}
+            #czzyv-play-settings-panel .cz-history-pstitle{padding:11px 12px;font-weight:600;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid rgba(255,255,255,.08)}
+            #czzyv-play-settings-panel .cz-history-pstitle .cz-history-psclose{cursor:pointer;opacity:.75;padding:0 2px}
+            #czzyv-play-settings-panel .cz-history-psrow{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.05)}
+            #czzyv-play-settings-panel .cz-history-ps-skip .cz-history-psrow{padding-left:16px;background:rgba(255,255,255,.03)}
+            #czzyv-play-settings-panel .cz-history-ps-time{display:block;cursor:default}
+            #czzyv-play-settings-panel .cz-history-ps-time .cz-history-psline1{display:flex;justify-content:space-between;align-items:center;gap:8px}
+            #czzyv-play-settings-panel .cz-history-ps-time .cz-history-psline2{display:flex;justify-content:flex-end;gap:6px;margin-top:7px}
+            #czzyv-play-settings-panel .cz-history-psval{color:#b8bbc2;font-size:12px;white-space:nowrap}
+            #czzyv-play-settings-panel button{background:#2b2c30;color:#e7e9ee;border:1px solid rgba(255,255,255,.14);border-radius:4px;padding:4px 9px;font-size:12px;cursor:pointer;white-space:nowrap}
+            #czzyv-play-settings-panel button:hover{background:#3f4045}
+            .cz-history-switch{position:relative;display:inline-block;width:36px;height:20px;flex:none}
+            .cz-history-switch input{position:absolute;opacity:0;width:0;height:0}
+            .cz-history-switch i{position:absolute;inset:0;background:#44464a;border-radius:999px;transition:.2s;cursor:pointer}
+            .cz-history-switch i::before{content:'';position:absolute;width:16px;height:16px;left:2px;top:2px;background:#fff;border-radius:50%;transition:.2s}
+            .cz-history-switch.on i{background:#ff5c38}
+            .cz-history-switch.on i::before{transform:translateX(16px)}
+        `;
+        document.head.appendChild(style);
+    }
+
+    function ensurePlaySettingsPanel() {
+        if (!window.art) return;
+        if (playSettingsPanel && playSettingsPanel.isConnected) return;
+        const art = window.art;
+        const host = (art && art.template && art.template.$player) || document.querySelector('.art-video-player') || document.body;
+        playSettingsPanel = document.createElement('div');
+        playSettingsPanel.id = 'czzyv-play-settings-panel';
+        playSettingsPanel.style.display = 'none';
+        playSettingsPanel.addEventListener('click', e => e.stopPropagation());
+        host.appendChild(playSettingsPanel);
+        renderPlaySettingsPanel();
+    }
+
+    function togglePlaySettingsPanel() {
+        ensurePlaySettingsPanel();
+        if (!playSettingsPanel) return;
+        playSettingsPanel.style.display = playSettingsPanel.style.display === 'none' ? 'block' : 'none';
+    }
+
+    function renderPlaySettingsPanel() {
+        ensurePlaySettingsStyle();
+        if (!playSettingsPanel) return;
+        const s = playSettings;
+        const fmtStart = v => (Number(v) > 0 ? formatSeconds(Number(v)) : '未设置');
+        const fmtEnd = v => (Number(v) > 0 ? `距结尾 ${formatSeconds(Number(v))}` : '未设置');
+        playSettingsPanel.innerHTML = `
+            <div class="cz-history-pstitle"><span>播放设置</span><span class="cz-history-psclose" role="button" title="关闭">✕</span></div>
+            <label class="cz-history-psrow">
+                <span>连续播放</span>
+                <span class="cz-history-switch${s.autoPlayNext ? ' on' : ''}"><input type="checkbox" data-ps="autoPlayNext"${s.autoPlayNext ? ' checked' : ''}><i></i></span>
+            </label>
+            <label class="cz-history-psrow">
+                <span>跳过片头片尾</span>
+                <span class="cz-history-switch${s.skipIntroOutro ? ' on' : ''}"><input type="checkbox" data-ps="skipIntroOutro"${s.skipIntroOutro ? ' checked' : ''}><i></i></span>
+            </label>
+            <div class="cz-history-ps-skip" style="${s.skipIntroOutro ? '' : 'display:none'}">
+                <div class="cz-history-psrow cz-history-ps-time">
+                    <div class="cz-history-psline1">
+                        <span>片头结束</span>
+                        <span class="cz-history-psval">${fmtStart(s.skipStart)}</span>
+                    </div>
+                    <div class="cz-history-psline2">
+                        <button type="button" data-ps-record="skipStart">记录当前时间</button>
+                        <button type="button" data-ps-clear="skipStart">清除</button>
+                    </div>
+                </div>
+                <div class="cz-history-psrow cz-history-ps-time">
+                    <div class="cz-history-psline1">
+                        <span>片尾开始</span>
+                        <span class="cz-history-psval">${fmtEnd(s.skipEnd)}</span>
+                    </div>
+                    <div class="cz-history-psline2">
+                        <button type="button" data-ps-record="skipEnd">记录当前时间</button>
+                        <button type="button" data-ps-clear="skipEnd">清除</button>
+                    </div>
+                </div>
+            </div>
+        `;
+        playSettingsPanel.querySelectorAll('input[data-ps]').forEach(input => {
+            input.addEventListener('change', e => {
+                const key = e.target.getAttribute('data-ps');
+                sendPlaySettingsPatch({ [key]: e.target.checked });
+            });
+        });
+        playSettingsPanel.querySelectorAll('button[data-ps-record]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const key = btn.getAttribute('data-ps-record');
+                const video = getIframeVideo();
+                let val = 0;
+                if (key === 'skipEnd') {
+                    const dur = (video && Number.isFinite(video.duration)) ? video.duration : 0;
+                    const ct = video ? (Number(video.currentTime) || 0) : 0;
+                    val = dur > 0 ? Math.max(0, Math.floor(dur - ct)) : 0;
+                } else {
+                    val = Math.floor(getCurrentVideoTime());
+                }
+                sendPlaySettingsPatch({ [key]: val > 0 ? val : 0 });
+            });
+        });
+        playSettingsPanel.querySelectorAll('button[data-ps-clear]').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const key = btn.getAttribute('data-ps-clear');
+                sendPlaySettingsPatch({ [key]: 0 });
+            });
+        });
+        const close = playSettingsPanel.querySelector('.cz-history-psclose');
+        if (close) close.addEventListener('click', () => { playSettingsPanel.style.display = 'none'; });
+    }
+
+    function ensurePlaySettingsButton() {
+        const art = window.art;
+        if (!art || !art.controls) return;
+        let settingControl = art.controls.setting;
+        if (!settingControl || !settingControl.parentElement) {
+            const nodes = querySelectorAllDeep('.art-controls .art-control', document);
+            for (const n of nodes) {
+                const t = String(n.getAttribute('title') || n.getAttribute('aria-label') || '').toLowerCase();
+                if (t && (t.indexOf('setting') >= 0 || t.indexOf('设置') >= 0)) { settingControl = n; break; }
+            }
+        }
+        if (!settingControl || !settingControl.parentElement) return;
+        if (!playSettingsButton) {
+            playSettingsButton = document.createElement('div');
+            playSettingsButton.className = 'art-control cz-history-play-settings hint--rounded hint--top';
+            playSettingsButton.setAttribute('data-index', '90');
+            playSettingsButton.setAttribute('role', 'button');
+            playSettingsButton.setAttribute('tabindex', '0');
+            playSettingsButton.setAttribute('aria-label', '播放设置');
+            playSettingsButton.setAttribute('title', '播放设置');
+            playSettingsButton.style.cssText = 'display:flex;align-items:center;justify-content:center;width:42px;height:42px;box-sizing:border-box;padding:0;cursor:pointer;color:inherit;white-space:nowrap;';
+            playSettingsButton.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="7" x2="20" y2="7"></line><circle cx="9" cy="7" r="2" fill="currentColor" stroke="none"></circle><line x1="4" y1="12" x2="20" y2="12"></line><circle cx="15" cy="12" r="2" fill="currentColor" stroke="none"></circle><line x1="4" y1="17" x2="20" y2="17"></line><circle cx="11" cy="17" r="2" fill="currentColor" stroke="none"></circle></svg>';
+            playSettingsButton.addEventListener('click', e => { e.stopPropagation(); requestPlaySettings(); togglePlaySettingsPanel(); });
+            playSettingsButton.addEventListener('keydown', e => {
+                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); requestPlaySettings(); togglePlaySettingsPanel(); }
+            });
+        }
+        if (!playSettingsButton.isConnected || playSettingsButton.parentElement !== settingControl.parentElement) {
+            settingControl.parentElement.insertBefore(playSettingsButton, settingControl);
+        }
+    }
+
+    function applySkipStart() {
+        const video = getIframeVideo();
+        if (!video || !playSettings.skipIntroOutro) return;
+        const skipStart = Number(playSettings.skipStart) || 0;
+        if (skipStart <= 0) return;
+        if (resumeSeekActive) return;
+        const src = video.currentSrc || video.src || '';
+        if (skipStartAppliedForSrc === src) return;
+        const ct = Number(video.currentTime) || 0;
+        if (ct >= skipStart - 1) return;
+        const duration = Number(video.duration) || 0;
+        if (duration > 0 && skipStart >= duration - 2) return;
+        skipStartAppliedForSrc = src;
+        try { video.currentTime = skipStart; } catch (e) {}
+        log('跳过片头', { 至: formatSeconds(skipStart) });
+    }
+
+    function applySkipEnd() {
+        const video = getIframeVideo();
+        if (!video || !playSettings.skipIntroOutro) return;
+        const skipEndOffset = Number(playSettings.skipEnd) || 0;
+        if (skipEndOffset <= 0) return;
+        const duration = Number(video.duration) || 0;
+        if (!Number.isFinite(duration) || duration <= 0) return;
+        const skipEndPoint = Math.max(0, duration - skipEndOffset);
+        const ct = Number(video.currentTime) || 0;
+        if (ct < skipEndPoint - 0.5) return;
+        const src = video.currentSrc || video.src || '';
+        if (skipEndAppliedForSrc === src) return;
+        const target = Math.max(0, duration - 1);
+        if (target <= ct) return;
+        skipEndAppliedForSrc = src;
+        try { video.currentTime = target; } catch (e) {}
+        log('跳过片尾', { 距结尾: formatSeconds(skipEndOffset), 从: formatSeconds(ct), 至: formatSeconds(target) });
+    }
+
     function startIframeProgressReporter() {
         log('播放器帧上报器已启动');
         let lastText = '';
@@ -420,6 +648,18 @@
         window.addEventListener('message', function (event) {
             const data = event.data;
             if (!data) return;
+            if (data.type === CONFIG.PLAY_SETTINGS_RESPONSE_MESSAGE) {
+                playSettingsSeriesKey = String(data.seriesKey || '');
+                playSettings = {
+                    autoPlayNext: data.settings ? data.settings.autoPlayNext !== false : true,
+                    skipIntroOutro: !!(data.settings && data.settings.skipIntroOutro),
+                    skipStart: Number(data.settings && data.settings.skipStart) || 0,
+                    skipEnd: Number(data.settings && data.settings.skipEnd) || 0
+                };
+                renderPlaySettingsPanel();
+                applySkipStart();
+                return;
+            }
             if (data.type === CONFIG.NEXT_EPISODE_RESPONSE_MESSAGE) {
                 iframeNextEpisodeUrl = data.available && data.url ? String(data.url) : '';
                 iframeNextEpisodeLabel = data.label ? String(data.label) : '';
@@ -438,11 +678,14 @@
         requestNextEpisodeInfo();
         setTimeout(requestNextEpisodeInfo, 800);
         setTimeout(requestNextEpisodeInfo, 2000);
+        setTimeout(requestPlaySettings, 0);
+        setTimeout(requestPlaySettings, 800);
+        setTimeout(requestPlaySettings, 2000);
         setInterval(() => reportProgress('poll'), CONFIG.IFRAME_REPORT_INTERVAL);
         // 不监听整个播放器 DOM：ArtPlayer 会持续修改控件节点，监听会造成高频扫描甚至卡死。
         // 用低频幂等检查确保播放器重建控件后按钮仍能恢复。
         if (iframeNextEpisodeButtonTimer) clearInterval(iframeNextEpisodeButtonTimer);
-        iframeNextEpisodeButtonTimer = setInterval(() => ensureNextEpisodeButton(), 1000);
+        iframeNextEpisodeButtonTimer = setInterval(() => { ensureNextEpisodeButton(); ensurePlaySettingsButton(); ensurePlaySettingsPanel(); }, 1000);
         log('下一集按钮检查器已启动（每 1 秒一次，未启用播放器 DOM 全量监听）');
 
         // ★ 新增：直接挂 video 事件，比只靠轮询/DOM 变化更可靠
@@ -460,18 +703,40 @@
             }, true);
         });
 
+        // 跳过片头：首次播放、新片源时应用一次
+        document.addEventListener('play', e => {
+            if (!e.target || e.target.tagName !== 'VIDEO') return;
+            applySkipStart();
+            const src = e.target.currentSrc || e.target.src || '';
+            if (skipStartAppliedForSrc !== src) skipStartAppliedForSrc = '';
+        }, true);
+        // 跳过片尾：每 timeupdate 检查一次
+        document.addEventListener('timeupdate', e => {
+            if (!e.target || e.target.tagName !== 'VIDEO') return;
+            applySkipEnd();
+        }, true);
+        // 连续播放：结束自动切下一集
+        document.addEventListener('ended', e => {
+            if (!e.target || e.target.tagName !== 'VIDEO') return;
+            if (playSettings.autoPlayNext && sendNextEpisodeNavigateRequest()) {
+                log('连续播放：已请求下一集');
+            }
+        }, true);
+
         document.addEventListener('loadedmetadata', e => {
             if (e.target && e.target.tagName === 'VIDEO') {
                 log('video loadedmetadata', { 时长: e.target.duration });
+                const src = e.target.currentSrc || e.target.src || '';
+                if (skipStartAppliedForSrc !== src) { skipStartAppliedForSrc = ''; skipEndAppliedForSrc = ''; }
                 if (iframeActiveSeekTarget > 0 && !iframeResumeFinished) startIframeSeek(iframeActiveSeekTarget, true);
             }
         }, true);
         document.addEventListener('canplay', e => {
             if (e.target && e.target.tagName === 'VIDEO' && iframeActiveSeekTarget > 0 && !iframeResumeFinished) startIframeSeek(iframeActiveSeekTarget, true);
         }, true);
-        setTimeout(() => { reportProgress('init-0.5s'); ensureNextEpisodeButton(); }, 500);
-        setTimeout(() => { reportProgress('init-1.5s'); ensureNextEpisodeButton(); }, 1500);
-        setTimeout(() => { reportProgress('init-3s'); ensureNextEpisodeButton(); }, 3000);
+        setTimeout(() => { reportProgress('init-0.5s'); ensureNextEpisodeButton(); ensurePlaySettingsButton(); }, 500);
+        setTimeout(() => { reportProgress('init-1.5s'); ensureNextEpisodeButton(); ensurePlaySettingsButton(); }, 1500);
+        setTimeout(() => { reportProgress('init-3s'); ensureNextEpisodeButton(); ensurePlaySettingsButton(); }, 3000);
         setTimeout(() => {
             const n = querySelectorAllDeep('video', document).length;
             log('3 秒自检：找到 video 元素数量 =', n, n ? '' : '（若为 0，说明播放器结构变化或未加载完）');
@@ -508,6 +773,38 @@
     }
     function saveHistory(list) {
         try { localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(list.slice(0, CONFIG.MAX_HISTORY))); } catch (e) {}
+    }
+
+    // === 播放设置（每部剧一条：连续播放 / 跳过片头片尾时间点）===
+    function getPlaySettingsMap() {
+        try {
+            const raw = localStorage.getItem(CONFIG.PLAY_SETTINGS_STORAGE_KEY);
+            const map = raw ? JSON.parse(raw) : {};
+            return (map && typeof map === 'object' && !Array.isArray(map)) ? map : {};
+        } catch (e) { return {}; }
+    }
+    function savePlaySettingsMap(map) {
+        try { localStorage.setItem(CONFIG.PLAY_SETTINGS_STORAGE_KEY, JSON.stringify(map)); } catch (e) {}
+    }
+    function getCurrentSeriesKey() {
+        try {
+            const key = normalizeSeriesKey(getMovieTitle());
+            return key || normalizeUrl(location.href);
+        } catch (e) { return normalizeUrl(location.href); }
+    }
+    function getPlaySettings(seriesKey) {
+        const s = getPlaySettingsMap()[seriesKey] || {};
+        return {
+            autoPlayNext: s.autoPlayNext !== false,
+            skipIntroOutro: !!s.skipIntroOutro,
+            skipStart: Number(s.skipStart) || 0,
+            skipEnd: Number(s.skipEnd) || 0
+        };
+    }
+    function updatePlaySettings(seriesKey, patch) {
+        const map = getPlaySettingsMap();
+        map[seriesKey] = Object.assign({}, map[seriesKey] || {}, patch || {});
+        savePlaySettingsMap(map);
     }
 
     function saveResumeTarget(item) {
@@ -726,6 +1023,23 @@
         window.addEventListener('message', function (event) {
             const data = event.data;
             if (!data) return;
+            if (data.type === CONFIG.PLAY_SETTINGS_REQUEST_MESSAGE) {
+                const key = getCurrentSeriesKey();
+                try {
+                    event.source.postMessage({
+                        type: CONFIG.PLAY_SETTINGS_RESPONSE_MESSAGE,
+                        seriesKey: key,
+                        settings: getPlaySettings(key),
+                        time: Date.now()
+                    }, '*');
+                } catch (e) { warn('发送播放设置失败', e); }
+                return;
+            }
+            if (data.type === CONFIG.PLAY_SETTINGS_UPDATE_MESSAGE) {
+                const key = data.seriesKey || getCurrentSeriesKey();
+                updatePlaySettings(key, data.patch || {});
+                return;
+            }
             if (data.type === CONFIG.NEXT_EPISODE_REQUEST_MESSAGE) {
                 const targetWindow = event.source;
                 const info = sendNextEpisodeInfo(targetWindow);

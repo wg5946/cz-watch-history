@@ -9,7 +9,7 @@ const functionNames = [
     'normalizeUrl', 'chineseNumberToInt', 'extractEpisodeNumber',
     'getCurrentEpisodeLinkFromDocument', 'getCurrentEpisodeLabelFromDocument',
     'getCurrentEpisodeNumberFromDocument', 'getNextEpisodeInfo', 'navigateToNextEpisode',
-    'activateNextEpisodeButton', 'ensureNextEpisodeButton'
+    'sendNextEpisodeNavigateRequest', 'activateNextEpisodeButton', 'ensureNextEpisodeButton'
 ];
 const functions = functionNames.map(name => {
     let start = source.indexOf(`    async function ${name}(`);
