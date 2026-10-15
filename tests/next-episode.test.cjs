@@ -12,7 +12,8 @@ const functionNames = [
     'activateNextEpisodeButton', 'ensureNextEpisodeButton'
 ];
 const functions = functionNames.map(name => {
-    const start = source.indexOf(`    function ${name}(`);
+    let start = source.indexOf(`    async function ${name}(`);
+    if (start < 0) start = source.indexOf(`    function ${name}(`);
     const end = source.indexOf('\n    }', start) + '\n    }'.length;
     assert.ok(start >= 0 && end > start, `找到函数 ${name}`);
     return source.slice(start, end);
@@ -57,8 +58,14 @@ function setup(groups, currentUrl) {
         },
         querySelectorAllDeep: () => [controls],
         throttledLog() {}, warn() {}, recordCurrentPlayPage() {},
+        fetchTextWithTimeout: async () => '',
+        extractPlayerUrlFromPlayHtml: () => '',
+        updatePlaylistHighlight() {}, sendNextEpisodeInfo() {},
+        history: { replaceState() {} },
         CONFIG: { NEXT_EPISODE_NAVIGATE_MESSAGE: 'next' },
         iframeNextEpisodeUrl: '', iframeNextEpisodeLabel: '',
+        iframeNextEpisodeSwitching: false,
+        iframeLastNextClickAt: 0,
     });
     vm.runInContext(functions, context);
     return { context, messages, getButton: () => button };
@@ -76,19 +83,19 @@ test('特别篇保留播放列表原始名称，不显示为前一集编号', ()
     assert.equal(context.getCurrentEpisodeNumberFromDocument(), 0);
 });
 
-test('普通集数返回当前线路下一集，并允许跳转', () => {
+test('普通集数返回当前线路下一集，并允许跳转', async () => {
     const { context } = setup([episodes], '/v_play/2.html');
     const info = context.getNextEpisodeInfo();
     assert.equal(info.url, 'https://www.4kcz.com/v_play/3.html');
     assert.equal(info.label, '第3集');
-    context.navigateToNextEpisode(info.url);
+    await context.navigateToNextEpisode(info.url);
     assert.equal(context.window.location.href, info.url);
 });
 
-test('最后一集不会跨线路跳到第一集，主站也拒绝跳转请求', () => {
+test('最后一集不会跨线路跳到第一集，主站也拒绝跳转请求', async () => {
     const { context } = setup([episodes, [['/v_play/other-1.html', '第1集']]], '/v_play/3.html');
     assert.equal(context.getNextEpisodeInfo().url, '');
-    context.navigateToNextEpisode('https://www.4kcz.com/v_play/other-1.html');
+    await context.navigateToNextEpisode('https://www.4kcz.com/v_play/other-1.html');
     assert.equal(context.window.location.href, undefined);
 });
 
@@ -144,12 +151,21 @@ test('没有下一集时按钮置灰，鼠标及键盘都不发送跳转请求',
     assert.equal(button.style.opacity, '1');
     assert.equal(button.title, '下一集 第2集');
     activate();
+    assert.equal(messages.length, 1); // 连续触发被防重入拦住，只发送一次
+
+    context.iframeLastNextClickAt = 0;
+    button.events.keydown({ ...event, key: 'Enter' });
+    assert.equal(messages.length, 2);
+
+    context.iframeLastNextClickAt = 0;
+    button.events.keydown({ ...event, key: ' ' });
     assert.equal(messages.length, 3);
 
     context.iframeNextEpisodeUrl = '';
     context.ensureNextEpisodeButton();
     assert.equal(getButton(), button);
     assert.equal(button.attrs['aria-disabled'], 'true');
+    context.iframeLastNextClickAt = 0;
     activate();
     assert.equal(messages.length, 3);
 });

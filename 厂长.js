@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         厂长资源 观影历史记录增强版
 // @namespace    https://www.4kcz.com/
-// @version      1.2.5
+// @version      1.2.6
 // @description  为 厂长资源 影视站增加观影历史、播放进度记录、最新集数检测、并支持从历史新窗口打开后自动跳转到上次播放时间
 // @author       wg5945
 // @license      MIT
@@ -45,6 +45,8 @@
         NEXT_EPISODE_REQUEST_MESSAGE: 'CZ_HISTORY_NEXT_EPISODE_REQUEST',
         NEXT_EPISODE_RESPONSE_MESSAGE: 'CZ_HISTORY_NEXT_EPISODE_RESPONSE',
         NEXT_EPISODE_NAVIGATE_MESSAGE: 'CZ_HISTORY_NEXT_EPISODE_NAVIGATE',
+        NEXT_EPISODE_LOAD_MESSAGE: 'CZ_HISTORY_NEXT_EPISODE_LOAD',
+        NEXT_EPISODE_LOAD_ACK_MESSAGE: 'CZ_HISTORY_NEXT_EPISODE_LOAD_ACK',
         RESUME_TOLERANCE: 3,
         RESUME_PROTECT_MS: 15000,
         RESUME_DISPATCH_INTERVAL: 800,
@@ -60,6 +62,7 @@
     };
 
     let lastSaveAt = 0;
+    let pendingNextFallback = null;
     let latestIframeProgress = null;
     let pendingResumeTarget = null;
     let pendingResumeStartAt = 0;
@@ -107,7 +110,7 @@
     }
 
     // 脚本加载确认（始终输出，仅一行）
-    console.log(`[观影历史] v1.2.5 已注入 ${isPlayerFrame() ? '播放器帧' : '主站'} | ${location.hostname}`);
+    console.log(`[观影历史] v1.2.6 已注入 ${isPlayerFrame() ? '播放器帧' : '主站'} | ${location.hostname}`);
 
     function normalizeUrl(url) {
         try { const u = new URL(url, location.href); u.hash = ''; return u.href; }
@@ -246,9 +249,10 @@
     let iframeNextEpisodeUrl = '';
     let iframeNextEpisodeLabel = '';
     let iframeNextEpisodeButtonTimer = null;
+    let iframeNextEpisodeSwitching = false;
+    let iframeLastNextClickAt = 0;
 
     function requestNextEpisodeInfo() {
-        throttledLog('nextEpisodeRequest', 5000, '请求下一集信息');
         try {
             window.top.postMessage({
                 type: CONFIG.NEXT_EPISODE_REQUEST_MESSAGE,
@@ -265,7 +269,10 @@
                 event.preventDefault();
                 event.stopPropagation();
             }
-            if (!iframeNextEpisodeUrl) return;
+            if (!iframeNextEpisodeUrl || iframeNextEpisodeSwitching) return;
+            const now = Date.now();
+            if (now - iframeLastNextClickAt < 1500) return;
+            iframeLastNextClickAt = now;
             try {
                 window.top.postMessage({
                     type: CONFIG.NEXT_EPISODE_NAVIGATE_MESSAGE,
@@ -300,7 +307,6 @@
                     (leftControls || controls).appendChild(button);
                 }
                 activateNextEpisodeButton(button);
-                throttledLog('nextEpisodeButtonCreated', 5000, '已创建下一集按钮');
             }
             const available = !!iframeNextEpisodeUrl;
             const label = available ? (iframeNextEpisodeLabel ? `下一集 ${iframeNextEpisodeLabel}` : '下一集') : '暂无下一集';
@@ -317,6 +323,90 @@
         }
     }
 
+    function getIframeVideo() {
+        const videos = querySelectorAllDeep('video', document);
+        return videos && videos.length ? videos[0] : null;
+    }
+
+    function sendNextEpisodeLoadAck(success, detail) {
+        try {
+            window.top.postMessage({
+                type: CONFIG.NEXT_EPISODE_LOAD_ACK_MESSAGE,
+                success: !!success,
+                detail: detail || '',
+                time: Date.now()
+            }, '*');
+        } catch (e) { warn('回执换源结果失败', e); }
+    }
+
+    // 根据视频源 URL 后缀判断 ArtPlayer 需要的 type（hls 命中播放器页面自定义的 playM3u8）
+    function detectStreamType(url) {
+        const u = String(url || '');
+        if (/\.m3u8(\?|#|$)/i.test(u)) return 'hls';
+        if (/\.mp4(\?|#|$)/i.test(u)) return 'mp4';
+        if (/\.flv(\?|#|$)/i.test(u)) return 'flv';
+        if (/\.mkv(\?|#|$)/i.test(u)) return 'mkv';
+        return '';
+    }
+
+    // 在当前 video 元素上换源：不销毁 iframe，从而保持全屏与播放状态
+    function applyNextEpisodePlayerSource(type, url, pageUrl) {
+        const art = window.art;
+        if (!art) return false;
+        const playAfterSwitch = () => {
+            const playPromise = art.play && art.play();
+            if (playPromise && typeof playPromise.catch === 'function') {
+                playPromise.catch(err => {
+                    warn('自动续播被浏览器拦截，尝试静音自动播放', err && err.name);
+                    const video = getIframeVideo();
+                    if (video) {
+                        video.muted = true;
+                        const mp = video.play();
+                        if (mp && typeof mp.catch === 'function') mp.catch(() => {});
+                    }
+                });
+            }
+        };
+        try {
+            if (pageUrl) { try { window.__czzyvNextPageUrl = pageUrl; } catch (e) {} }
+            const normalizedType = String(type || '').toLowerCase();
+            if (normalizedType === 'hls' || normalizedType === 'm3u8') {
+                // 跟随页面自身 type，确保命中其 customType 键（页面用 hls / m3u8 两种写法）
+                art.type = normalizedType;
+            } else if (normalizedType === 'mp4') {
+                art.type = 'mp4';
+            }
+            const switchResult = art.switchUrl(url);
+            if (switchResult && typeof switchResult.then === 'function') {
+                switchResult.then(playAfterSwitch, err => { warn('switchUrl 失败', err); playAfterSwitch(); });
+            } else {
+                playAfterSwitch();
+            }
+            return true;
+        } catch (e) {
+            warn('切换播放源异常', e);
+            return false;
+        }
+    }
+
+    async function handleNextEpisodeLoad(data) {
+        if (!data || !data.streamUrl) { sendNextEpisodeLoadAck(false, '缺视频源'); return; }
+        if (iframeNextEpisodeSwitching) return;
+        iframeNextEpisodeSwitching = true;
+        try {
+            const streamUrl = String(data.streamUrl);
+            const type = detectStreamType(streamUrl);
+            if (!applyNextEpisodePlayerSource(type, streamUrl, data.pageUrl)) throw new Error('ArtPlayer 实例不可用');
+            log('✔ 下一集已在当前播放器无缝换源', { type: type || '(自动)' });
+            sendNextEpisodeLoadAck(true, 'ok');
+        } catch (e) {
+            warn('下一集无缝换源失败，将回退整页跳转', e && e.message);
+            try { sendNextEpisodeLoadAck(false, String((e && e.message) || e)); } catch (e2) {}
+        } finally {
+            iframeNextEpisodeSwitching = false;
+        }
+    }
+
     function startIframeProgressReporter() {
         log('播放器帧上报器已启动');
         let lastText = '';
@@ -325,7 +415,6 @@
             if (!progress || !progress.progressText) return;
             if (progress.progressText === lastText) return;
             lastText = progress.progressText;
-            throttledLog('reportProgress', 30000, '上报进度', progress.progressText, '来源:', reason || 'poll');
             try { window.top.postMessage({ type: CONFIG.IFRAME_PROGRESS_MESSAGE, progress, href: location.href, time: Date.now() }, '*'); } catch (e) { warn('进度上报失败', e); }
         }
         window.addEventListener('message', function (event) {
@@ -334,11 +423,11 @@
             if (data.type === CONFIG.NEXT_EPISODE_RESPONSE_MESSAGE) {
                 iframeNextEpisodeUrl = data.available && data.url ? String(data.url) : '';
                 iframeNextEpisodeLabel = data.label ? String(data.label) : '';
-                throttledLog('nextEpisodeResponse', 5000, '收到下一集信息', {
-                    available: !!iframeNextEpisodeUrl,
-                    label: iframeNextEpisodeLabel
-                });
                 ensureNextEpisodeButton();
+                return;
+            }
+            if (data.type === CONFIG.NEXT_EPISODE_LOAD_MESSAGE) {
+                handleNextEpisodeLoad(data);
                 return;
             }
             if (data.type !== CONFIG.IFRAME_RESUME_MESSAGE) return;
@@ -544,10 +633,6 @@
     function sendNextEpisodeInfo(targetWindow) {
         if (!targetWindow) return null;
         const info = getNextEpisodeInfo();
-        throttledLog('nextEpisodeInfo', 5000, '发送下一集信息', {
-            available: !!(info && info.url),
-            label: info && info.label ? info.label : ''
-        });
         try {
             targetWindow.postMessage({
                 type: CONFIG.NEXT_EPISODE_RESPONSE_MESSAGE,
@@ -560,14 +645,81 @@
         return info;
     }
 
-    function navigateToNextEpisode(url) {
+    function extractPlayerUrlFromPlayHtml(html) {
+        if (!html) return '';
+        try {
+            const doc = new DOMParser().parseFromString(html, 'text/html');
+            const iframe = doc.querySelector('.viframe');
+            return iframe ? (iframe.getAttribute('src') || iframe.src || '') : '';
+        } catch (e) { return ''; }
+    }
+
+    // 从播放器地址的 url 参数里直接取明文视频源（仅部分线路是明文 m3u8/mp4）；
+    // 加密线路（如 alistdr 前缀）取不出，返回空走整页跳转。
+    function extractDirectStreamFromPlayerUrl(playerUrl) {
+        if (!playerUrl) return '';
+        try {
+            const u = new URL(playerUrl, location.href);
+            const raw = u.searchParams.get('url');
+            if (!raw) return '';
+            if (/^https?:\/\//i.test(raw) && /\.(?:m3u8|mp4|flv|mkv|ts)(\?|#|$)/i.test(raw)) return raw;
+            return '';
+        } catch (e) { return ''; }
+    }
+
+    function updatePlaylistHighlight(pageUrl) {
+        try {
+            const target = normalizeUrl(pageUrl);
+            document.querySelectorAll('.juji_list a[href]').forEach(a => {
+                a.classList.toggle('pbplay', normalizeUrl(a.getAttribute('href')) === target);
+            });
+        } catch (e) {}
+    }
+
+    // 优先尝试在当前播放器 iframe 内无缝换源（保留全屏与播放状态）；
+    // 只有下一集播放器地址里带明文视频源时才走此路径，否则回退整页跳转。
+    async function navigateToNextEpisode(url, sourceWindow) {
         const info = getNextEpisodeInfo();
         if (!info || !info.url || normalizeUrl(url) !== info.url) {
             warn('下一集地址校验失败，已取消跳转', { requested: url, expected: info && info.url });
             return;
         }
         recordCurrentPlayPage(true);
-        window.location.href = info.url;
+
+        let nextStreamUrl = '';
+        try {
+            const html = await fetchTextWithTimeout(info.url);
+            nextStreamUrl = extractDirectStreamFromPlayerUrl(extractPlayerUrlFromPlayHtml(html));
+        } catch (e) { warn('获取下一集播放器地址失败，将整页跳转', e); }
+
+        if (sourceWindow && nextStreamUrl) {
+            pendingNextFallback = { url: info.url, sourceWindow: sourceWindow, time: Date.now() };
+            try {
+                sourceWindow.postMessage({
+                    type: CONFIG.NEXT_EPISODE_LOAD_MESSAGE,
+                    streamUrl: nextStreamUrl,
+                    pageUrl: info.url,
+                    time: Date.now()
+                }, '*');
+            } catch (e) {
+                warn('发送无缝换源请求失败，将整页跳转', e);
+                pendingNextFallback = null;
+                window.location.href = info.url;
+                return;
+            }
+            try { history.replaceState(null, '', info.url); } catch (e) { warn('更新地址栏失败', e); }
+            updatePlaylistHighlight(info.url);
+            try { sendNextEpisodeInfo(sourceWindow); } catch (e) {}
+            // 3 秒内未收到“失败”回执即视为换源成功；只有收到失败回执才整页跳转
+            setTimeout(() => {
+                if (pendingNextFallback && pendingNextFallback.url === info.url) {
+                    pendingNextFallback = null;
+                    log('下一集无缝换源已处理（未收到失败回执）');
+                }
+            }, 3000);
+        } else {
+            window.location.href = info.url;
+        }
     }
 
     function bindIframeProgressMessage() {
@@ -583,7 +735,18 @@
                 return;
             }
             if (data.type === CONFIG.NEXT_EPISODE_NAVIGATE_MESSAGE) {
-                navigateToNextEpisode(data.url);
+                navigateToNextEpisode(data.url, event.source);
+                return;
+            }
+            if (data.type === CONFIG.NEXT_EPISODE_LOAD_ACK_MESSAGE) {
+                if (!data.success && pendingNextFallback) {
+                    const fb = pendingNextFallback;
+                    pendingNextFallback = null;
+                    warn('下一集无缝换源失败，改回整页跳转', { detail: data.detail });
+                    window.location.href = fb.url;
+                } else if (pendingNextFallback) {
+                    pendingNextFallback = null;
+                }
                 return;
             }
             if (data.type === CONFIG.IFRAME_RESUME_ACK_MESSAGE) {
@@ -595,7 +758,6 @@
                 currentTime: data.progress.currentTime || 0, duration: data.progress.duration || 0,
                 progressText: data.progress.progressText, time: Date.now(), iframeHref: data.href || ''
             };
-            throttledLog('recvProgress', 30000, '✔ 收到 iframe 进度', data.progress.progressText);
             if (pendingResumeTarget && !pendingResumeDone && latestIframeProgress.currentTime >= pendingResumeTarget.currentTime - CONFIG.RESUME_TOLERANCE) {
                 log('进度已达到跳转目标，停止派发');
                 stopResumeDispatcher();
@@ -831,7 +993,7 @@
                 renderHistoryList();
             }
         } catch (e) {
-            warn('封面图自动重抓失败', { url: item && item.url, error: e && e.message });
+            log('封面图自动重抓失败', { url: item && item.url, error: e && e.message });
         } finally {
             posterFetchingSet.delete(key);
         }
@@ -854,7 +1016,7 @@
                 renderHistoryList();
             }
         } catch (e) {
-            console.warn('[观影历史] 封面图fetch失败', e);
+            log('封面图fetch失败', e);
         } finally {
             posterFetchingSet.delete(historyKey);
         }
@@ -1021,13 +1183,12 @@
 
         if (isZero) {
             if (CONFIG.PREVENT_ZERO_PROGRESS_OVERWRITE && oldItem && oldCurrentTime >= minValid) {
-                log('跳过记录：本次进度为 0，保护已有记录不被覆盖', { 已有: formatSeconds(oldCurrentTime), 标题: displayTitle });
                 return;
             }
             if (CONFIG.SKIP_ZERO_PROGRESS_RECORD && !oldItem) {
-                warn('跳过记录：未取到播放进度（', displayTitle, '），可能播放器尚未加载');
+                log('跳过记录：未取到播放进度（', displayTitle, '），可能播放器尚未加载');
                 if (!latestIframeProgress) {
-                    warn('  原因：从未收到 iframe 进度上报，请确认播放器域名在 @match 范围内。')
+                    log('  原因：从未收到 iframe 进度上报，请确认播放器域名在 @match 范围内。')
                 }
                 log('跳过记录详情', {
                     标题: displayTitle,
@@ -1482,7 +1643,7 @@
                 // 若当前已不是失效那张，说明期间已更新过，无需再抓
                 if (broken && item.poster && normalizePosterUrl(item.poster) !== broken) return;
                 refetchPosterForItem(item, broken);
-            } catch (e) { warn('封面图失败处理异常', e); }
+            } catch (e) { log('封面图失败处理异常', e); }
         };
     }
 
@@ -1506,7 +1667,6 @@
         // 只在页面结构变化后重新绑定 video 事件。
         // 不在这里保存历史，避免 renderHistoryList() 修改 DOM 后触发递归保存/重绘。
         const observer = new MutationObserver(() => {
-            throttledLog('topMutation', 5000, '主页面 DOM 发生变化，重新检查 video 事件');
             bindVideoEvents();
         });
         observer.observe(document.body, { childList: true, subtree: true });
